@@ -1,0 +1,129 @@
+<?php
+
+use CodeIgniter\Router\RouteCollection;
+
+/** @var RouteCollection $routes */
+$routes->get('/', 'Home::index');
+
+$routes->get('iclock/cdata', 'IclockController::cdata');
+$routes->post('iclock/cdata', 'IclockController::cdata');
+$routes->get('iclock/getrequest', 'IclockController::getrequest');
+$routes->post('iclock/devicecmd', 'IclockController::devicecmd');
+
+$routes->post('api/auth/login', 'Api\\AuthController::login');
+
+$routes->group('api', ['filter' => 'jwt'], static function ($routes): void {
+	$routes->get('me', 'Api\\UsersController::me');
+	$routes->put('me', 'Api\\UsersController::updateMe');
+	$routes->post('me/change-password', 'Api\\UsersController::changeOwnPassword');
+	$routes->get('me/historique', 'Api\\PointagesController::historiquePersonnel');
+	$routes->post('me/pointage', 'Api\\PointagesController::pointerPersonnel');
+	$routes->post('me/passkeys/registration-options', 'Api\\WebAuthnController::registrationOptions');
+	$routes->post('me/passkeys/authentication-options', 'Api\\WebAuthnController::authenticationOptions');
+	$routes->post('me/passkeys/register', 'Api\\WebAuthnController::register');
+	$routes->post('auth/ldap/test', 'Api\\AuthController::ldapTest');
+	$routes->post('auth/ldap/sync-users', 'Api\\AuthController::ldapSyncUsers');
+	$routes->get('admin/tenants', 'Api\\AdminTenantsController::index');
+	$routes->get('admin/dashboard/kpis', 'Api\\DashboardController::kpis');
+	$routes->get('admin/tenants/(:num)', 'Api\\AdminTenantsController::show/$1');
+	$routes->post('admin/tenants', 'Api\\AdminTenantsController::create');
+	$routes->put('admin/tenants/(:num)', 'Api\\AdminTenantsController::update/$1');
+	$routes->delete('admin/tenants/(:num)', 'Api\\AdminTenantsController::delete/$1');
+	$routes->get('admin/tenant', 'Api\\TenantConfigController::show');
+	$routes->put('admin/tenant', 'Api\\TenantConfigController::update');
+	$routes->get('admin/tenant/pointage-parametres', 'Api\\TenantConfigController::pointageParametres');
+	$routes->put('admin/tenant/pointage-parametres', 'Api\\TenantConfigController::mettreAJourPointageParametres');
+	$routes->post('admin/tenant/logo', 'Api\\TenantConfigController::uploadLogo');
+	$routes->get('users', 'Api\\UsersController::index');
+	$routes->get('users/(:num)', 'Api\\UsersController::show/$1');
+	$routes->post('users', 'Api\\UsersController::create');
+	$routes->put('users/(:num)', 'Api\\UsersController::update/$1');
+	$routes->delete('users/(:num)', 'Api\\UsersController::delete/$1');
+	$routes->post('users/(:num)/reset-password', 'Api\\UsersController::resetPassword/$1');
+
+	$routes->get('capteurs', 'Api\\CapteursController::index');
+	$routes->post('capteurs', 'Api\\CapteursController::create');
+	$routes->get('capteurs/(:num)', 'Api\\CapteursController::show/$1');
+	$routes->put('capteurs/(:num)', 'Api\\CapteursController::update/$1');
+	$routes->patch('capteurs/(:num)', 'Api\\CapteursController::update/$1');
+	$routes->delete('capteurs/(:num)', 'Api\\CapteursController::delete/$1');
+	$routes->get('capteurs/(:num)/info', 'Api\\CapteursController::deviceInfo/$1');
+	$routes->post('capteurs/(:num)/test', 'Api\\CapteursController::test/$1');
+	$routes->post('capteurs/(:num)/restart', 'Api\\CapteursController::restart/$1');
+	$routes->post('capteurs/(:num)/enable', 'Api\\CapteursController::enable/$1');
+	$routes->post('capteurs/(:num)/sync-users', 'Api\\CapteursController::syncUsers/$1');
+	$routes->post('capteurs/(:num)/sync-attendance', 'Api\\CapteursController::syncAttendance/$1');
+	$routes->post('capteurs/(:num)/sync-affectations', 'Api\\CapteursController::syncAssignments/$1');
+	$routes->get('tenants/(:num)/capteurs', 'Api\\CapteursController::index/$1');
+
+	$routes->get('employes', 'Api\\EmployesController::index');
+	$routes->post('employes', 'Api\\EmployesController::create');
+	$routes->get('employes/(:num)', 'Api\\EmployesController::show/$1');
+	$routes->put('employes/(:num)', 'Api\\EmployesController::update/$1');
+	$routes->patch('employes/(:num)', 'Api\\EmployesController::update/$1');
+	$routes->delete('employes/(:num)', 'Api\\EmployesController::delete/$1');
+	$routes->get('employes/(:num)/capteurs', 'Api\\EmployesController::capteurs/$1');
+	$routes->post('employes/(:num)/capteurs', 'Api\\EmployesController::addCapteur/$1');
+	$routes->delete('employes/(:num)/capteurs/(:num)', 'Api\\EmployesController::removeCapteur/$1/$2');
+	$routes->post('employes/(:num)/deplacer', 'Api\\EmployesController::moveCapteur/$1');
+	$routes->post('employes/(:num)/desactiver', 'Api\\EmployesController::deactivate/$1');
+	$routes->post('employes/(:num)/reactiver', 'Api\\EmployesController::reactivate/$1');
+	$routes->get('employes/(:num)/presence', 'Api\\PointagesController::presence/$1');
+	$routes->get('employes/(:num)/horaire', 'Api\\HorairesController::employe/$1');
+	$routes->get('admin/employes/(:num)/contrats', 'Api\\ContratsHoraireController::index/$1');
+	$routes->get('admin/employes/(:num)/contrats/actif', 'Api\\ContratsHoraireController::actif/$1');
+	$routes->post('admin/employes/(:num)/contrats', 'Api\\ContratsHoraireController::create/$1');
+	$routes->put('admin/employes/(:num)/contrats/(:num)', 'Api\\ContratsHoraireController::update/$1/$2');
+	$routes->delete('admin/employes/(:num)/contrats/(:num)', 'Api\\ContratsHoraireController::delete/$1/$2');
+
+	$routes->get('pointages', 'Api\PointagesController::index');
+	$routes->post('pointages', 'Api\\PointagesController::create');
+	$routes->post('pointages/(:num)/recalculer', 'Api\\PointagesController::recalculer/$1');
+	$routes->get('pointages/stats', 'Api\PointagesController::stats');
+	$routes->get('pointages/stats/presence', 'Api\PointagesController::statsPresence');
+	$routes->get('pointages/export', 'Api\PointagesController::export');
+	$routes->get('realtime/pointages', 'Api\\RealtimeController::pointages');
+	$routes->get('unites', 'Api\\UnitesController::index');
+	$routes->get('unites/(:num)/descendantes', 'Api\\UnitesController::descendants/$1');
+	$routes->get('unites/(:num)/employes', 'Api\\UnitesController::employees/$1');
+	$routes->get('organisation', 'Api\\OrganisationController::index');
+	$routes->post('organisation/unites', 'Api\\OrganisationController::createUnite');
+	$routes->put('organisation/unites/(:num)', 'Api\\OrganisationController::updateUnite/$1');
+	$routes->delete('organisation/unites/(:num)', 'Api\\OrganisationController::deleteUnite/$1');
+	$routes->post('organisation/mandats', 'Api\\OrganisationController::createMandat');
+	$routes->put('organisation/mandats/(:num)', 'Api\\OrganisationController::updateMandat/$1');
+	$routes->delete('organisation/mandats/(:num)', 'Api\\OrganisationController::deleteMandat/$1');
+	$routes->get('horaires', 'Api\\HorairesController::index');
+	$routes->post('horaires/valider', 'Api\\HorairesController::validerPlages');
+	$routes->post('horaires/defaut', 'Api\\HorairesController::creerDefaut');
+	$routes->put('horaires/(:num)', 'Api\\HorairesController::modifier/$1');
+	$routes->put('horaires/(:num)/defaut', 'Api\\HorairesController::definirDefaut/$1');
+	$routes->get('shifts', 'Api\\ShiftsController::index');
+	$routes->get('shifts/(:num)', 'Api\\ShiftsController::show/$1');
+	$routes->post('shifts', 'Api\\ShiftsController::create');
+	$routes->put('shifts/(:num)', 'Api\\ShiftsController::update/$1');
+	$routes->delete('shifts/(:num)', 'Api\\ShiftsController::delete/$1');
+	$routes->post('shifts/assigner', 'Api\\ShiftsController::assigner');
+	$routes->delete('shifts/assigner/(:num)', 'Api\\ShiftsController::desassigner/$1');
+	$routes->get('shifts/employe/(:num)', 'Api\\ShiftsController::getEmployeShifts/$1');
+	$routes->get('jours-feries', 'Api\\JoursFeriesController::index');
+	$routes->get('jours-feries/(:num)', 'Api\\JoursFeriesController::show/$1');
+	$routes->post('jours-feries', 'Api\\JoursFeriesController::create');
+	$routes->put('jours-feries/(:num)', 'Api\\JoursFeriesController::update/$1');
+	$routes->delete('jours-feries/(:num)', 'Api\\JoursFeriesController::delete/$1');
+	$routes->post('jours-feries/importer-burundi', 'Api\\JoursFeriesController::importerBurundi');
+	$routes->get('rapports/employes-visibles', 'Api\\RapportsController::employesVisibles');
+	$routes->get('rapports/quotidien', 'Api\\RapportsController::quotidien');
+	$routes->get('rapports/quotidien/export', 'Api\\RapportsController::export');
+	$routes->post('rapports/quotidien/envoyer', 'Api\\RapportsController::envoyer');
+	$routes->get('rapports/journalier/configuration', 'Api\\RapportsController::configurationJournaliere');
+	$routes->put('rapports/journalier/configuration', 'Api\\RapportsController::enregistrerConfigurationJournaliere');
+	$routes->get('rapports/historique', 'Api\\RapportsController::historique');
+	$routes->get('rapports/historique/(:num)', 'Api\\RapportsController::historiqueDetail/$1');
+	$routes->get('rapports/planifies', 'Api\\RapportsController::planifies');
+	$routes->post('rapports/planifies', 'Api\\RapportsController::creerPlanifie');
+	$routes->put('rapports/planifies/(:num)', 'Api\\RapportsController::modifierPlanifie/$1');
+	$routes->delete('rapports/planifies/(:num)', 'Api\\RapportsController::supprimerPlanifie/$1');
+});
+
+$routes->options('(:any)', static fn () => service('response')->setStatusCode(204));
