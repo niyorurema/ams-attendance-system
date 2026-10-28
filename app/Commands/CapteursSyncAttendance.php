@@ -3,6 +3,7 @@
 namespace App\Commands;
 
 use App\Services\ZKTecoService;
+use App\Services\SystemJobService;
 use CodeIgniter\CLI\BaseCommand;
 use CodeIgniter\CLI\CLI;
 use Throwable;
@@ -49,7 +50,11 @@ class CapteursSyncAttendance extends BaseCommand
             return EXIT_ERROR;
         }
 
+        $jobs = null;
+        $runId = null;
         try {
+            $jobs = new SystemJobService();
+            $runId = $jobs->start($this->name, (int) $capteurId);
             $result = (new ZKTecoService())->syncPointages((int) $capteurId, $batch, $limit);
             $stats = $result['stats'];
 
@@ -61,8 +66,30 @@ class CapteursSyncAttendance extends BaseCommand
                 $stats['invalides'] ?? 0
             ));
 
-            return $result['status'] === 'SUCCESS' ? EXIT_SUCCESS : EXIT_ERROR;
+            $success = $result['status'] === 'SUCCESS';
+            $jobs->finish(
+                $runId,
+                $success ? 'SUCCESS' : 'ERROR',
+                $stats,
+                $success ? null : 'Le capteur a retourné un statut d’échec.'
+            );
+
+            return $success ? EXIT_SUCCESS : EXIT_ERROR;
         } catch (Throwable $e) {
+            log_message('error', 'Échec de la synchronisation des pointages du capteur {sensorId} : {error}', [
+                'sensorId' => $capteurId,
+                'error' => $e->getMessage(),
+            ]);
+            if ($jobs !== null && $runId !== null) {
+                try {
+                    $jobs->finish($runId, 'ERROR', [], $e->getMessage());
+                } catch (Throwable $trackingError) {
+                    log_message('critical', 'Impossible de journaliser l’échec du capteur {sensorId} : {error}', [
+                        'sensorId' => $capteurId,
+                        'error' => $trackingError->getMessage(),
+                    ]);
+                }
+            }
             CLI::error('Échec de la synchronisation des pointages : ' . $e->getMessage());
 
             return EXIT_ERROR;

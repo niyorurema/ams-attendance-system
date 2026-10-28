@@ -31,7 +31,7 @@ final class DashboardKpiService
         $finMoisPrecedent = $maintenant->modify('last day of last month')->format('Y-m-d');
 
         $tenant = $this->db->table('tenants')
-            ->select('jours_travailles')
+            ->select('jours_travailles, actif_regles_nouvelles')
             ->where('id', $tenantId)
             ->where('deleted_at', null)
             ->get()
@@ -60,33 +60,61 @@ final class DashboardKpiService
         $joursFeries = $this->chargerJoursFeries($tenantId, $debutHistorique, $date);
         $projections = $this->chargerProjections($tenantId, $debutHistorique, $date);
         $pointagesParJour = $this->chargerPointagesParJour($tenantId, $debutHistorique, $date);
+        // The dashboard uses cached projections; live per-employee interpretation belongs to explicit daily views.
+        $interpretateur = null;
 
         $employesAttendusParJour = [];
+        $presenceInterpreteeParJour = [];
         $unitesAttendues = [];
         $dateCourante = new DateTimeImmutable($debutHistorique);
         $dateFin = new DateTimeImmutable($date);
         while ($dateCourante <= $dateFin) {
             $jour = $dateCourante->format('Y-m-d');
             $jourSemaine = (int) $dateCourante->format('N');
-            $ferie = $this->jourFeriePourDate($joursFeries, $jour);
-            $jourOuvre = $ferie === null
-                ? in_array($jourSemaine, $joursTenant, true)
-                : (int) $ferie['travaille'] === 1;
-
-            if ($jourOuvre) {
-                foreach ($contrats as $employeId => $contratsEmploye) {
-                    foreach ($contratsEmploye as $contrat) {
-                        if ($contrat['date_debut'] > $jour
-                            || ($contrat['date_fin'] !== null && $contrat['date_fin'] < $jour)
-                            || ! in_array($jourSemaine, $contrat['jours_travail'], true)
-                        ) {
-                            continue;
+            if ($interpretateur !== null) {
+                $attendus = [];
+                $journees = [];
+                foreach ($employeIds as $employeId) {
+                    $resultat = $interpretateur->interpreterJournee($employeId, $jour);
+                    $statut = (string) ($resultat['statut_global'] ?? $resultat['statut'] ?? 'ANORMAL');
+                    if ($statut === 'FERIE'
+                        || $statut === 'REPOS'
+                        || ($resultat['details']['evaluation'] ?? null) === 'AUCUN_JUGEMENT'
+                    ) {
+                        continue;
+                    }
+                    $attendus[] = $employeId;
+                    $journees[$employeId] = $resultat;
+                    if ($jour === $date && $uniteParEmploye[$employeId] !== null) {
+                        $unitesAttendues[$uniteParEmploye[$employeId]][$employeId] = true;
+                    }
+                }
+                $employesAttendusParJour[$jour] = array_fill_keys($attendus, true);
+                $presenceInterpreteeParJour[$jour] = [
+                    'attendus' => $attendus,
+                    'journees' => $journees,
+                    'stats' => self::calculerPresenceJour($attendus, $journees),
+                ];
+            } else {
+                $ferie = $this->jourFeriePourDate($joursFeries, $jour);
+                $jourOuvre = $ferie === null
+                    ? in_array($jourSemaine, $joursTenant, true)
+                    : (int) $ferie['travaille'] === 1;
+                if ($jourOuvre) {
+                    foreach ($contrats as $employeId => $contratsEmploye) {
+                        foreach ($contratsEmploye as $contrat) {
+                            if ($contrat['date_debut'] > $jour
+                                || ($contrat['date_fin'] !== null && $contrat['date_fin'] < $jour)
+                                || ! in_array($jourSemaine, $contrat['jours_travail'], true)
+                            ) {
+                                continue;
+                            }
+                            $employesAttendusParJour[$jour][$employeId] = true;
+                            if ($jour === $date && $uniteParEmploye[$employeId] !== null) {
+                                $unitesAttendues[$uniteParEmploye[$employeId]][$employeId] = true;
+                            }
+                            break;
                         }
-                        $employesAttendusParJour[$jour][$employeId] = true;
-                        if ($jour === $date && $uniteParEmploye[$employeId] !== null) {
-                            $unitesAttendues[$uniteParEmploye[$employeId]][$employeId] = true;
-                        }
-                        break;
                     }
                 }
             }
@@ -94,12 +122,10 @@ final class DashboardKpiService
         }
 
         $attendusAujourdhui = array_keys($employesAttendusParJour[$date] ?? []);
-        $presenceJour = self::calculerPresenceJour(
-            $attendusAujourdhui,
-            $projections[$date] ?? []
-        );
+        $presenceJour = $presenceInterpreteeParJour[$date]['stats']
+            ?? self::calculerPresenceJour($attendusAujourdhui, $projections[$date] ?? []);
         $totalAttendus = count($attendusAujourdhui);
-        if (isset($pointagesParJour[$date])) {
+        if ($interpretateur === null && isset($pointagesParJour[$date])) {
             $observesAujourdhui = $pointagesParJour[$date];
             $employesObserves = array_keys($observesAujourdhui);
             if ($attendusAujourdhui === []) {
@@ -116,7 +142,10 @@ final class DashboardKpiService
             ));
             $presenceJour['presents'] = max($presenceJour['presents'], count($employesPresents));
             $presenceJour['en_retard'] = max($presenceJour['en_retard'], $retardsObserves);
-            $presenceJour['absents'] = max(0, $totalAttendus - $presenceJour['presents']);
+            $presenceJour['absents'] = max(
+                0,
+                $totalAttendus - $presenceJour['presents'] - $presenceJour['en_cours']
+            );
         }
         $totalEmployes = count($employeIds);
 
@@ -124,6 +153,21 @@ final class DashboardKpiService
         $dateCourante = new DateTimeImmutable($debutHistorique);
         while ($dateCourante <= $dateFin) {
             $jour = $dateCourante->format('Y-m-d');
+            if ($interpretateur !== null) {
+                $journeeInterpretee = $presenceInterpreteeParJour[$jour];
+                $stats = $journeeInterpretee['stats'];
+                $evolution[] = [
+                    'date' => $jour,
+                    'presents' => $stats['presents'],
+                    'retards' => $stats['en_retard'],
+                    'absents' => $stats['absents'],
+                    'en_cours' => $stats['en_cours'],
+                    'total' => count($journeeInterpretee['attendus']),
+                ];
+                $dateCourante = $dateCourante->modify('+1 day');
+                continue;
+            }
+
             $jourSemaine = (int) $dateCourante->format('N');
             $ferie = $this->jourFeriePourDate($joursFeries, $jour);
             $jourOuvre = $ferie === null
@@ -153,12 +197,14 @@ final class DashboardKpiService
                 ));
                 $retards = max($stats['en_retard'], $retardsObserves);
             }
+            $enCours = $stats['en_cours'];
             $total = max(count($attendus), $presents);
             $evolution[] = [
                 'date' => $jour,
                 'presents' => $presents,
                 'retards' => $retards,
-                'absents' => max(0, count($attendus) - $presents),
+                'absents' => max(0, count($attendus) - $presents - $enCours),
+                'en_cours' => $enCours,
                 'total' => $total,
             ];
             $dateCourante = $dateCourante->modify('+1 day');
@@ -182,7 +228,7 @@ final class DashboardKpiService
         foreach ($unitesAttendues as $uniteId => $attendus) {
             $stats = self::calculerPresenceJour(
                 array_keys($attendus),
-                $projections[$date] ?? []
+                $presenceInterpreteeParJour[$date]['journees'] ?? $projections[$date] ?? []
             );
             $total = count($attendus);
             $topUnites[] = [
@@ -228,6 +274,7 @@ final class DashboardKpiService
                 'presents' => $presenceJour['presents'],
                 'en_retard' => $presenceJour['en_retard'],
                 'absents' => $presenceJour['absents'],
+                'en_cours' => $presenceJour['en_cours'],
                 'sans_pointage_depart' => $presenceJour['sans_pointage_depart'],
             ],
             'pointages' => ['aujourdhui' => $pointagesAujourdhui],
@@ -250,16 +297,24 @@ final class DashboardKpiService
      *
      * @param list<int|string> $employesAttendus
      * @param array<int|string, array<string, mixed>> $projectionsParEmploye
-     * @return array{presents:int,en_retard:int,absents:int,sans_pointage_depart:int}
+    * @return array{presents:int,en_retard:int,absents:int,en_cours:int,sans_pointage_depart:int}
      */
     public static function calculerPresenceJour(array $employesAttendus, array $projectionsParEmploye): array
     {
         $presents = 0;
         $retards = 0;
         $sansDepart = 0;
+        $enCours = 0;
         foreach ($employesAttendus as $employeId) {
             $projection = $projectionsParEmploye[$employeId] ?? $projectionsParEmploye[(int) $employeId] ?? null;
-            if ($projection === null || $projection['heure_arrivee'] === null) {
+            if ($projection === null) {
+                continue;
+            }
+            if (($projection['statut_global'] ?? null) === 'EN_COURS') {
+                $enCours++;
+                continue;
+            }
+            if (($projection['heure_arrivee'] ?? null) === null) {
                 continue;
             }
             $presents++;
@@ -276,7 +331,8 @@ final class DashboardKpiService
         return [
             'presents' => $presents,
             'en_retard' => $retards,
-            'absents' => max(0, $attendus - $presents),
+            'absents' => max(0, $attendus - $presents - $enCours),
+            'en_cours' => $enCours,
             'sans_pointage_depart' => $sansDepart,
         ];
     }

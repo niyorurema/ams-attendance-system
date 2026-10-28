@@ -80,7 +80,7 @@ class EmployeHistoryService
         $timezone = (new TenantTimezoneService($this->db))->forTenant((int) $utilisateur['tenant_id']);
         $maintenant = new \DateTimeImmutable('now', $timezone);
         $dateDuJour = (string) ($filtres['date_jour'] ?? $maintenant->format('Y-m-d'));
-        $presenceDuJour = $this->calculPresenceService->calculerJournee((int) $employe['id'], $dateDuJour);
+        $presenceDuJour = $this->calculPresenceService->interpreterJournee((int) $employe['id'], $dateDuJour);
         $etapesDuJour = $presenceDuJour['analyse_plages'] ?? [];
         $nombreEtapes = count($etapesDuJour);
         $etapesEffectuees = count(array_filter(
@@ -124,7 +124,7 @@ class EmployeHistoryService
             $pointage['unite'] = $employe['unite'];
             $jour = substr((string) $pointage['date_pointage'], 0, 10);
             if (! isset($statuts[$jour])) {
-                $calcul = $this->calculPresenceService->calculerJournee((int) $employe['id'], $jour);
+                $calcul = $this->calculPresenceService->interpreterJournee((int) $employe['id'], $jour);
                 $statuts[$jour] = ['statut' => $calcul['statut'], 'heures_travaillees' => $calcul['heures_travaillees'], 'retard_minutes' => $calcul['retard_total_minutes']];
             }
         }
@@ -182,7 +182,7 @@ class EmployeHistoryService
         $dateFin = new \DateTimeImmutable($fin);
         for (; $date <= $dateFin; $date = $date->modify('+1 day')) {
             $dateTexte = $date->format('Y-m-d');
-            $calcul = $this->calculPresenceService->calculerJournee($employeId, $dateTexte);
+            $calcul = $this->calculPresenceService->interpreterJournee($employeId, $dateTexte);
             $totaux['retard_total_minutes'] += (int) $calcul['retard_total_minutes'];
             $totaux['heures_travaillees_minutes'] += (int) round((float) $calcul['heures_travaillees'] * 60);
             if ($calcul['statut'] === 'ABSENT') {
@@ -225,7 +225,7 @@ class EmployeHistoryService
     /** @return array<string, mixed> */
     public function getStatutJour(int $employeId, string $date): array
     {
-        return $this->calculPresenceService->calculerJournee($employeId, $date);
+        return $this->calculPresenceService->interpreterJournee($employeId, $date);
     }
 
     protected function libelleType(string $type): string

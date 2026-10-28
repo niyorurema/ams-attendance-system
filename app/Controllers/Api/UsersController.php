@@ -38,9 +38,38 @@ class UsersController extends BaseApiController
 
         $search = trim((string) ($this->request->getGet('search') ?? ''));
         if ($search !== '') {
+            $employeeIds = array_column(
+                Database::connect()->table('employes')
+                    ->select('id')
+                    ->where('tenant_id', $tenantId)
+                    ->where('deleted_at', null)
+                    ->groupStart()
+                        ->like('nom', $search)
+                        ->orLike('prenom', $search)
+                        ->orLike('matricule', $search)
+                    ->groupEnd()
+                    ->get()
+                    ->getResultArray(),
+                'id'
+            );
+
             $model->groupStart()
                 ->like('email', $search)
-                ->orLike('nom_complet', $search)
+                ->orLike('nom_complet', $search);
+            if ($employeeIds !== []) {
+                $model->orWhereIn('employe_id', $employeeIds);
+            }
+            $model->groupEnd();
+        }
+
+        $withoutEmail = $this->request->getGet('sans_email');
+        if ($withoutEmail !== null && $withoutEmail !== '') {
+            if ((string) $withoutEmail !== '1') {
+                return $this->errorResponse('Le filtre sans adresse e-mail doit valoir 1.', 422);
+            }
+            $model->groupStart()
+                ->where('email', null)
+                ->orWhere("TRIM(email) = ''", null, false)
                 ->groupEnd();
         }
 
@@ -62,7 +91,7 @@ class UsersController extends BaseApiController
 
         $limit = $this->boundedInteger($this->request->getGet('limit'), 10, 1, 100);
         $offset = $this->boundedInteger($this->request->getGet('offset'), 0, 0, 1000000);
-        $total = (clone $model)->countAllResults();
+        $total = $model->countAllResults(false);
         $items = $model->orderBy('created_at', 'DESC')->findAll($limit, $offset);
 
         return $this->successResponse([
@@ -197,8 +226,12 @@ class UsersController extends BaseApiController
             return $this->errorResponse('Vous ne pouvez pas attribuer ce rôle.', 403);
         }
         if (array_key_exists('email', $data)) {
-            $data['email'] = strtolower(trim((string) $data['email']));
-            if ($this->emailExists($tenantId, $data['email'], $id)) {
+            $email = strtolower(trim((string) ($data['email'] ?? '')));
+            if ($email === '' && ! $this->emailMayBeEmpty($user)) {
+                return $this->errorResponse('Une adresse email est requise pour ce compte.', 422);
+            }
+            $data['email'] = $email === '' ? null : $email;
+            if ($data['email'] !== null && $this->emailExists($tenantId, $data['email'], $id)) {
                 return $this->errorResponse('Cet email existe déjà dans ce tenant.', 409);
             }
         }
@@ -343,11 +376,14 @@ class UsersController extends BaseApiController
         $tenantId = (int) $user['tenant_id'];
         $updates = [];
         if (array_key_exists('email', $data)) {
-            $email = strtolower(trim((string) $data['email']));
-            if ($this->emailExists($tenantId, $email, (int) $user['id'])) {
+            $email = strtolower(trim((string) ($data['email'] ?? '')));
+            if ($email === '' && ! $this->emailMayBeEmpty($user)) {
+                return $this->errorResponse('Une adresse email est requise pour ce compte.', 422);
+            }
+            if ($email !== '' && $this->emailExists($tenantId, $email, (int) $user['id'])) {
                 return $this->errorResponse('Cet email existe déjà dans ce tenant.', 409);
             }
-            $updates['email'] = $email;
+            $updates['email'] = $email === '' ? null : $email;
         }
         if (array_key_exists('nom_complet', $data)) $updates['nom_complet'] = trim((string) $data['nom_complet']);
         if (array_key_exists('telephone', $data)) $updates['telephone'] = $this->nullableText($data['telephone']);
@@ -404,11 +440,15 @@ class UsersController extends BaseApiController
 
     private function validateUserInput(array $input, bool $creating): ?ResponseInterface
     {
-        if (array_key_exists('email', $input)
-            && (! is_string($input['email']) || ! filter_var(trim($input['email']), FILTER_VALIDATE_EMAIL)
-                || strlen(trim($input['email'])) > 150)
-        ) {
-            return $this->errorResponse('Une adresse email valide est requise.', 422);
+        if (array_key_exists('email', $input)) {
+            $email = is_string($input['email']) ? trim($input['email']) : '';
+            $emailIsOptional = ! $creating
+                && ($input['email'] === null || (is_string($input['email']) && $email === ''));
+            if (! $emailIsOptional
+                && (! is_string($input['email']) || ! filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150)
+            ) {
+                return $this->errorResponse('Une adresse email valide est requise.', 422);
+            }
         }
         if (array_key_exists('nom_complet', $input)
             && (! is_string($input['nom_complet']) || trim($input['nom_complet']) === ''
@@ -462,6 +502,16 @@ class UsersController extends BaseApiController
             $query->where('id !=', $exceptId);
         }
         return $query->countAllResults() > 0;
+    }
+
+    private function emailMayBeEmpty(array $user): bool
+    {
+        return ($user['email'] ?? null) === null
+            || (
+                (string) ($user['role'] ?? '') === 'lecteur'
+                && (int) ($user['employe_id'] ?? 0) > 0
+                && strtoupper((string) ($user['auth_source'] ?? 'LOCAL')) === 'LDAP'
+            );
     }
 
     private function validateEmploye(mixed $employeId, int $tenantId): bool

@@ -3,6 +3,7 @@
 namespace App\Commands;
 
 use App\Models\CapteurModel;
+use App\Services\SystemJobService;
 use App\Services\ZKTecoService;
 use CodeIgniter\CLI\BaseCommand;
 use CodeIgniter\CLI\CLI;
@@ -44,10 +45,21 @@ class CapteursScanAll extends BaseCommand
         CLI::write('');
         CLI::write(sprintf('Surveillance continue activée : polling toutes les %d secondes.', $interval), 'green');
 
+        $jobs = new SystemJobService();
+        $runId = $jobs->start($this->name);
         while (true) {
+            $cycleSummary = ['capteurs' => [], 'erreurs' => []];
             foreach ($capteurs as $capteur) {
                 try {
                     $result = (new ZKTecoService())->syncPointages((int) $capteur['id']);
+                    $sensorStatus = $result['status'] ?? 'UNKNOWN';
+                    $cycleSummary['capteurs'][$capteur['id']] = [
+                        'status' => $sensorStatus,
+                        'stats' => $result['stats'] ?? [],
+                    ];
+                    if ($sensorStatus !== 'SUCCESS') {
+                        $cycleSummary['erreurs'][$capteur['id']] = 'Le capteur a retourné le statut ' . $sensorStatus . '.';
+                    }
                     CLI::write(sprintf(
                         'Capteur #%d : %s | lus=%d | insérés=%d | doublons=%d',
                         $capteur['id'],
@@ -57,10 +69,18 @@ class CapteursScanAll extends BaseCommand
                         $result['stats']['doublons'] ?? 0
                     ));
                 } catch (Throwable $e) {
+                    $cycleSummary['erreurs'][$capteur['id']] = $e->getMessage();
                     CLI::write(sprintf('Capteur #%d : erreur -> %s', $capteur['id'], $e->getMessage()), 'red');
                 }
             }
 
+            $jobs->heartbeat(
+                $runId,
+                $cycleSummary,
+                $cycleSummary['erreurs'] === []
+                    ? null
+                    : sprintf('%d capteur(s) en erreur lors du dernier cycle.', count($cycleSummary['erreurs']))
+            );
             sleep($interval);
         }
     }

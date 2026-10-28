@@ -46,7 +46,12 @@ class RapportsController extends BaseApiController
         }
 
         try {
-            return $this->successResponse((new RapportService())->genererRapportQuotidien((int) $claims->sub, $date));
+            $service = new RapportService();
+            return $this->successResponse($service->preparerRapportPourDestinataire(
+                ['user_id' => (int) $claims->sub, 'unite_id' => null],
+                $date,
+                $date
+            ));
         } catch (Throwable $e) {
             log_message('error', 'Génération rapport quotidien impossible : {error}', ['error' => $e->getMessage()]);
             return $this->errorResponse('Impossible de générer ce rapport.', 403);
@@ -72,7 +77,11 @@ class RapportsController extends BaseApiController
 
         try {
             $service = new RapportService();
-            $rapport = $service->genererRapportQuotidien((int) $claims->sub, $date);
+            $rapport = $service->preparerRapportPourDestinataire(
+                ['user_id' => (int) $claims->sub, 'unite_id' => null],
+                $date,
+                $date
+            );
             $chemin = $format === 'PDF' ? $service->genererPDF($rapport) : $service->genererExcel($rapport);
             $extension = $format === 'PDF' ? 'pdf' : 'xlsx';
             $nomFichier = sprintf('rapport_%s.%s', $date, $extension);
@@ -128,9 +137,17 @@ class RapportsController extends BaseApiController
             return $this->errorResponse('Destinataire introuvable pour ce tenant.', 400);
         }
 
+        $service = new RapportService();
+        if (! $service->envoiRapportActifPourTenant($tenantId)) {
+            return $this->errorResponse('Les envois de rapports sont désactivés pour ce tenant.', 403);
+        }
+
         try {
-            $service = new RapportService();
-            $rapport = $service->genererRapportQuotidien((int) $userId, $date);
+            $rapport = $service->preparerRapportPourDestinataire(
+                ['user_id' => (int) $userId, 'unite_id' => null],
+                $date,
+                $date
+            );
             if (! $service->envoyerEmail((int) $userId, $rapport, $format, $langue)) {
                 return $this->errorResponse('L’envoi du rapport par e-mail a échoué.', 502);
             }
@@ -184,7 +201,7 @@ class RapportsController extends BaseApiController
                 'heure_envoi' => '08:00:00',
                 'format' => 'PDF',
                 'langue' => 'fr',
-                'actif' => 1,
+                'actif' => 0,
             ],
             'destinataires' => $destinataires,
             'jours_travailles' => \App\Services\JourTravailleService::normaliserJours($tenant['jours_travailles'] ?? null),
@@ -328,6 +345,98 @@ class RapportsController extends BaseApiController
         }
 
         return $this->configurationJournaliere();
+    }
+
+    /** Liste les rapports automatiques J-1 qui peuvent être consultés avant l’envoi. */
+    public function apercusJournaliers(): ResponseInterface
+    {
+        $claims = $this->claims();
+        $tenantId = $this->tenantId();
+        if ($claims === null || $tenantId === null) {
+            return $this->authorizationError();
+        }
+        if (! $this->peutPrevisualiserRapportJournalier((string) $claims->role)) {
+            return $this->errorResponse('Droits de supervision requis.', 403);
+        }
+
+        try {
+            $now = (new \App\Services\TenantTimezoneService())->now($tenantId);
+            $service = new RapportService();
+
+            return $this->successResponse($this->donneesApercusJournaliers(
+                $service,
+                $tenantId,
+                (int) $claims->sub,
+                $this->canManage(),
+                $now
+            ));
+        } catch (Throwable $e) {
+            log_message('error', 'Prévisualisation des rapports journaliers impossible : {error}', [
+                'error' => $e->getMessage(),
+            ]);
+            return $this->errorResponse('Impossible de charger les rapports à prévisualiser.', 500);
+        }
+    }
+
+    /** Retourne le contenu complet d’un rapport automatique sans envoyer de courriel. */
+    public function apercuJournalier(): ResponseInterface
+    {
+        $claims = $this->claims();
+        $tenantId = $this->tenantId();
+        if ($claims === null || $tenantId === null) {
+            return $this->authorizationError();
+        }
+        if (! $this->peutPrevisualiserRapportJournalier((string) $claims->role)) {
+            return $this->errorResponse('Droits de supervision requis.', 403);
+        }
+
+        $userId = filter_var($this->request->getGet('user_id'), FILTER_VALIDATE_INT);
+        $uniteParam = $this->request->getGet('unite_id');
+        $uniteId = $uniteParam === 'global' ? null : filter_var($uniteParam, FILTER_VALIDATE_INT);
+        if ($userId === false || $userId < 1 || ($uniteParam !== 'global' && ($uniteId === false || $uniteId < 1))) {
+            return $this->errorResponse('Destinataire ou unité de rapport invalide.', 400);
+        }
+
+        try {
+            $now = (new \App\Services\TenantTimezoneService())->now($tenantId);
+            $service = new RapportService();
+            $apercus = $this->donneesApercusJournaliers(
+                $service,
+                $tenantId,
+                (int) $claims->sub,
+                $this->canManage(),
+                $now
+            );
+            $destinataire = null;
+            foreach ($apercus['items'] as $item) {
+                if ($item['user_id'] === (int) $userId && $item['unite_id'] === $uniteId) {
+                    $destinataire = $item;
+                    break;
+                }
+            }
+            if ($destinataire === null) {
+                return $this->errorResponse('Rapport à prévisualiser introuvable pour ce compte et ce tenant.', 404);
+            }
+
+            $contenu = $service->preparerRapportPourDestinataire(
+                [
+                    'user_id' => (int) $userId,
+                    'unite_id' => $uniteId,
+                ],
+                $apercus['date_rapport'],
+                $apercus['date_execution']
+            );
+
+            return $this->successResponse([
+                'destinataire' => $destinataire,
+                'contenu' => $contenu,
+            ]);
+        } catch (Throwable $e) {
+            log_message('error', 'Ouverture du rapport journalier en prévisualisation impossible : {error}', [
+                'error' => $e->getMessage(),
+            ]);
+            return $this->errorResponse('Impossible de générer le contenu de ce rapport.', 500);
+        }
     }
 
     /** Liste les rapports archivés accessibles à l’utilisateur courant. */
@@ -562,5 +671,85 @@ class RapportsController extends BaseApiController
     {
         $parsed = DateTimeImmutable::createFromFormat('!Y-m-d', $date);
         return $parsed !== false && $parsed->format('Y-m-d') === $date;
+    }
+
+    private function peutPrevisualiserRapportJournalier(string $role): bool
+    {
+        return $this->canManage()
+            || in_array($role, ['superviseur', 'chef_service', 'directeur', 'commissaire'], true);
+    }
+
+    /**
+     * @return array{
+     *     date_execution:string,
+     *     date_rapport:string,
+     *     heure_envoi:?string,
+     *     configuration_active:bool,
+     *     pret_a_envoyer:bool,
+     *     raison_non_envoi:?string,
+     *     items:array<int,array<string,mixed>>
+     * }
+     */
+    private function donneesApercusJournaliers(
+        RapportService $service,
+        int $tenantId,
+        int $viewerId,
+        bool $canManage,
+        DateTimeImmutable $now
+    ): array {
+        $dateExecution = $now->format('Y-m-d');
+        $dateRapport = $now->modify('-1 day')->format('Y-m-d');
+        $configuration = Database::connect()->table('rapport_journalier_configs')
+            ->select('id, heure_envoi, actif')
+            ->where('tenant_id', $tenantId)
+            ->get()
+            ->getRowArray();
+        $raisonNonEnvoi = null;
+        if ($configuration === null) {
+            $raisonNonEnvoi = 'CONFIGURATION_ABSENTE';
+        } elseif ((int) $configuration['actif'] !== 1) {
+            $raisonNonEnvoi = 'DESACTIVE';
+        } elseif (! (new \App\Services\JourTravailleService())->estTravaille($tenantId, $dateExecution)) {
+            $raisonNonEnvoi = 'JOUR_NON_TRAVAILLE';
+        } elseif ((new \App\Services\JourFerieService())->getJourFerie($tenantId, $dateRapport) !== null) {
+            $raisonNonEnvoi = 'JOUR_FERIE';
+        } elseif ((string) $configuration['heure_envoi'] > $now->format('H:i:s')) {
+            $raisonNonEnvoi = 'HEURE_NON_ATTEINTE';
+        }
+
+        $items = [];
+        if ($configuration !== null) {
+            $clesArchives = $service->listerClesRapportsJournaliersArchives(
+                $tenantId,
+                (int) $configuration['id'],
+                $dateRapport
+            );
+            $destinataires = $service->listerDestinatairesRapportJournalier(
+                $tenantId,
+                $dateExecution,
+                $canManage ? null : $viewerId
+            );
+            foreach ($destinataires as $destinataire) {
+                $cle = $destinataire['user_id'] . ':' . ($destinataire['unite_id'] ?? 'global');
+                if (isset($clesArchives[$cle])) {
+                    continue;
+                }
+
+                $items[] = [
+                    ...$destinataire,
+                    'date_rapport' => $dateRapport,
+                ];
+            }
+        }
+
+        return [
+            'date_execution' => $dateExecution,
+            'date_rapport' => $dateRapport,
+            'heure_envoi' => $configuration['heure_envoi'] ?? null,
+            'configuration_active' => $configuration !== null && (int) $configuration['actif'] === 1,
+            'pret_a_envoyer' => $raisonNonEnvoi === null,
+            'raison_non_envoi' => $raisonNonEnvoi,
+            'items' => $items,
+        ];
     }
 }

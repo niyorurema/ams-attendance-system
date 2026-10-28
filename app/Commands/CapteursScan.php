@@ -3,6 +3,7 @@
 namespace App\Commands;
 
 use App\Models\CapteurModel;
+use App\Services\SystemJobService;
 use App\Services\ZKTecoService;
 use CodeIgniter\CLI\BaseCommand;
 use CodeIgniter\CLI\CLI;
@@ -74,15 +75,26 @@ class CapteursScan extends BaseCommand
             ? 'Scan ponctuel des pointages par checkpoint.'
             : sprintf('Surveillance continue : scan toutes les %d secondes. Arrêt avec Ctrl+C.', $interval), 'green');
 
+        $jobs = new SystemJobService();
+        $runId = $jobs->start($this->name, $allSensors ? null : (int) $capteurId);
         do {
             $cycleStartedAt = date('Y-m-d H:i:s');
             CLI::write(sprintf('Cycle de scan : %s', $cycleStartedAt), 'blue');
             $cycleErrors = 0;
+            $cycleSummary = ['capteurs' => [], 'erreurs' => []];
 
             foreach ($capteurIds as $currentSensorId) {
                 try {
                     $result = (new ZKTecoService())->syncPointages($currentSensorId);
                     $stats = $result['stats'];
+                    $cycleSummary['capteurs'][$currentSensorId] = [
+                        'status' => $result['status'],
+                        'stats' => $stats,
+                    ];
+                    if ($result['status'] !== 'SUCCESS') {
+                        $cycleErrors++;
+                        $cycleSummary['erreurs'][$currentSensorId] = 'Le capteur a retourné le statut ' . $result['status'] . '.';
+                    }
                     CLI::write(sprintf(
                         'Capteur #%d tenant #%d : lus=%d, insérés=%d, doublons=%d, invalides=%d, checkpoint=%s',
                         $currentSensorId,
@@ -95,14 +107,27 @@ class CapteursScan extends BaseCommand
                     ));
                 } catch (Throwable $e) {
                     $cycleErrors++;
+                    $cycleSummary['erreurs'][$currentSensorId] = $e->getMessage();
                     CLI::error(sprintf('Capteur #%d : %s', $currentSensorId, $e->getMessage()));
                 }
             }
 
             if ($interval === null) {
+                $jobs->finish(
+                    $runId,
+                    $cycleErrors === 0 ? 'SUCCESS' : 'ERROR',
+                    $cycleSummary,
+                    $cycleErrors === 0 ? null : sprintf('%d capteur(s) en erreur.', $cycleErrors)
+                );
+
                 return $cycleErrors === 0 ? EXIT_SUCCESS : EXIT_ERROR;
             }
 
+            $jobs->heartbeat(
+                $runId,
+                $cycleSummary,
+                $cycleErrors === 0 ? null : sprintf('%d capteur(s) en erreur lors du dernier cycle.', $cycleErrors)
+            );
             CLI::write(sprintf('Cycle terminé; prochain scan dans %d secondes.', $interval));
             sleep($interval);
         } while (true);

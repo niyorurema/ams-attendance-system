@@ -5,8 +5,12 @@ namespace App\Controllers\Api;
 use App\Models\CapteurModel;
 use App\Models\EmployeModel;
 use App\Services\AffectationService;
+use App\Services\EmployeAccountService;
 use CodeIgniter\HTTP\ResponseInterface;
 use Config\Database;
+use PhpOffice\PhpSpreadsheet\Cell\DataType;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Throwable;
 
 /**
@@ -39,6 +43,14 @@ class EmployesController extends BaseApiController
             $model->where('unite_id', $uniteId);
         }
 
+        $sansUnite = $this->request->getGet('sans_unite');
+        if ($sansUnite !== null && $sansUnite !== '') {
+            if ((string) $sansUnite !== '1') {
+                return $this->errorResponse('Le filtre sans unité organisationnelle doit valoir 1.', 422);
+            }
+            $model->where('unite_id', null);
+        }
+
         $actif = $this->request->getGet('actif');
         if ($actif === '0' || $actif === '1') {
             $model->where('actif', (int) $actif);
@@ -63,7 +75,7 @@ class EmployesController extends BaseApiController
 
             $formatted = $this->normalizeDateFilterValue($value, str_contains($param, 'to') || str_contains($param, 'To'));
             if ($formatted !== null) {
-                $model->where($field, $formatted, $operator === '>=' ? '>=' : '<=');
+                $model->where($field . ' ' . $operator, $formatted);
             }
         }
 
@@ -110,6 +122,145 @@ class EmployesController extends BaseApiController
         ]);
     }
 
+    public function exportExcel(): ResponseInterface
+    {
+        return $this->exportEmployees('excel');
+    }
+
+    public function exportPdf(): ResponseInterface
+    {
+        return $this->exportEmployees('pdf');
+    }
+
+    private function exportEmployees(string $format): ResponseInterface
+    {
+        $tenantId = $this->tenantId();
+        if ($tenantId === null) {
+            return $this->authorizationError();
+        }
+
+        try {
+            $employees = $this->employeeExportQuery($tenantId)->get()->getResultArray();
+            $headers = ['Matricule', 'Nom', 'Prénom', 'Email', 'Téléphone', 'Unité', 'Poste', 'Statut'];
+            $rows = array_map(static fn (array $employee): array => [
+                (string) ($employee['matricule'] ?? ''),
+                (string) ($employee['nom'] ?? ''),
+                (string) ($employee['prenom'] ?? ''),
+                (string) ($employee['email'] ?? ''),
+                (string) ($employee['telephone'] ?? ''),
+                (string) ($employee['unite_nom'] ?? ''),
+                (string) ($employee['poste'] ?? ''),
+                (int) ($employee['actif'] ?? 0) === 1 ? 'Actif' : 'Inactif',
+            ], $employees);
+            $filename = 'employes_' . date('Ymd_His');
+
+            if ($format === 'excel') {
+                $spreadsheet = new Spreadsheet();
+                $sheet = $spreadsheet->getActiveSheet();
+                $sheet->setTitle('Employés');
+                foreach ($headers as $column => $header) {
+                    $sheet->setCellValueExplicit([$column + 1, 1], $header, DataType::TYPE_STRING);
+                }
+                foreach ($rows as $rowIndex => $row) {
+                    foreach ($row as $column => $value) {
+                        $sheet->setCellValueExplicit([$column + 1, $rowIndex + 2], $value, DataType::TYPE_STRING);
+                    }
+                }
+                foreach (range(1, count($headers)) as $column) {
+                    $sheet->getColumnDimensionByColumn($column)->setAutoSize(true);
+                }
+
+                ob_start();
+                (new Xlsx($spreadsheet))->save('php://output');
+                $content = ob_get_clean();
+                if (! is_string($content)) {
+                    throw new \RuntimeException('Impossible de générer le fichier Excel.');
+                }
+
+                return $this->response
+                    ->setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    ->setHeader('Content-Disposition', 'attachment; filename="' . $filename . '.xlsx"')
+                    ->setHeader('Cache-Control', 'no-store')
+                    ->setBody($content);
+            }
+
+            $htmlRows = '';
+            foreach ($rows as $row) {
+                $htmlRows .= '<tr>';
+                foreach ($row as $value) {
+                    $htmlRows .= '<td>' . htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</td>';
+                }
+                $htmlRows .= '</tr>';
+            }
+            $htmlHeaders = implode('', array_map(
+                static fn (string $header): string => '<th>' . htmlspecialchars($header, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</th>',
+                $headers
+            ));
+            $html = '<!doctype html><html><head><meta charset="utf-8"><style>'
+                . 'body{font-family:sans-serif;font-size:9pt}h1{font-size:16pt}table{width:100%;border-collapse:collapse}'
+                . 'th,td{border:1px solid #bbb;padding:5px;text-align:left}th{background:#eee}'
+                . '</style></head><body><h1>Liste des employés</h1><table><thead><tr>'
+                . $htmlHeaders . '</tr></thead><tbody>' . $htmlRows . '</tbody></table></body></html>';
+            $pdf = new \Mpdf\Mpdf(['orientation' => 'L', 'format' => 'A4']);
+            $pdf->WriteHTML($html);
+
+            return $this->response
+                ->setHeader('Content-Type', 'application/pdf')
+                ->setHeader('Content-Disposition', 'attachment; filename="' . $filename . '.pdf"')
+                ->setHeader('Cache-Control', 'no-store')
+                ->setBody($pdf->Output('', 'S'));
+        } catch (Throwable $exception) {
+            log_message('error', 'Export des employés impossible : {error}', [
+                'error' => $exception->getMessage(),
+                'tenant_id' => $tenantId,
+                'format' => $format,
+            ]);
+
+            return $this->errorResponse('Impossible de générer l’export des employés.', 500);
+        }
+    }
+
+    private function employeeExportQuery(int $tenantId): \CodeIgniter\Database\BaseBuilder
+    {
+        $query = Database::connect()->table('employes e')
+            ->select('e.matricule, e.nom, e.prenom, e.email, e.telephone, e.poste, e.actif, u.nom AS unite_nom')
+            ->join('unites_organisationnelles u', 'u.id = e.unite_id AND u.tenant_id = e.tenant_id AND u.deleted_at IS NULL', 'left')
+            ->where('e.tenant_id', $tenantId)
+            ->where('e.deleted_at', null);
+
+        $search = trim((string) ($this->request->getGet('search') ?? ''));
+        if ($search !== '') {
+            $query->groupStart()
+                ->like('e.nom', $search)
+                ->orLike('e.prenom', $search)
+                ->orLike('e.matricule', $search)
+                ->orLike('e.email', $search)
+                ->groupEnd();
+        }
+        $unitId = filter_var($this->request->getGet('unite_id'), FILTER_VALIDATE_INT);
+        if ($unitId !== false && $unitId !== null && $unitId > 0) {
+            $query->where('e.unite_id', $unitId);
+        }
+        $active = $this->request->getGet('actif');
+        if ($active === '0' || $active === '1') {
+            $query->where('e.actif', (int) $active);
+        }
+        foreach ([
+            'created_from' => ['e.created_at', '>=', false],
+            'created_to' => ['e.created_at', '<=', true],
+            'sync_from' => ['e.derniere_sync', '>=', false],
+            'sync_to' => ['e.derniere_sync', '<=', true],
+        ] as $parameter => [$field, $operator, $endOfRange]) {
+            $value = trim((string) ($this->request->getGet($parameter) ?? ''));
+            $formatted = $value === '' ? null : $this->normalizeDateFilterValue($value, $endOfRange);
+            if ($formatted !== null) {
+                $query->where($field . ' ' . $operator, $formatted);
+            }
+        }
+
+        return $query->orderBy('e.nom')->orderBy('e.prenom');
+    }
+
     public function show(int $id): ResponseInterface
     {
         $employe = $this->trouverEmploye($id);
@@ -144,12 +295,33 @@ class EmployesController extends BaseApiController
         $data['empreinte_enrolee'] ??= 0;
         $data['nb_empreintes'] ??= 0;
         $data['role_capteur'] ??= 0;
-        $model = new EmployeModel();
-        if (! $model->insert($data)) {
-            return $this->errorResponse(implode(' ', $model->errors()), 422);
-        }
+        $db = Database::connect();
+        $db->transBegin();
+        try {
+            $model = new EmployeModel();
+            if (! $model->insert($data)) {
+                $db->transRollback();
+                return $this->errorResponse(implode(' ', $model->errors()), 422);
+            }
 
-        return $this->successResponse($this->trouverEmploye((int) $model->getInsertID()), 'Employé créé.', 201);
+            $employeId = (int) $model->getInsertID();
+            $employe = $model->find($employeId);
+            if (! is_array($employe)) {
+                throw new \RuntimeException('Employé créé mais impossible à relire pour créer son compte.');
+            }
+            (new EmployeAccountService($db))->ensureReaderAccount($employe, $tenantId);
+
+            if ($db->transStatus() === false) {
+                throw new \RuntimeException('Transaction de création de l’employé invalide.');
+            }
+            $db->transCommit();
+
+            return $this->successResponse($this->trouverEmploye($employeId), 'Employé créé avec son compte lecteur.', 201);
+        } catch (Throwable $e) {
+            $db->transRollback();
+            log_message('error', 'Création employé et compte lecteur impossible : {error}', ['error' => $e->getMessage()]);
+            return $this->errorResponse('Impossible de créer l’employé et son compte lecteur.', 500);
+        }
     }
 
     public function update(int $id): ResponseInterface

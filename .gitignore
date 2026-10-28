@@ -60,6 +60,8 @@ Vagrantfile
 /writable/uploads/*
 !/writable/uploads/index.html
 
+/writable/keys/
+
 /writable/debugbar/*
 !/writable/debugbar/index.html
 

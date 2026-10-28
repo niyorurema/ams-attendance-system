@@ -93,11 +93,11 @@ REDIS_PORT = 6379
 REDIS_DATABASE = 0
 ```
 
-Paramètres facultatifs selon l’installation :
+Après la première connexion, configurez LDAP dans **Paramètres → Connexion LDAP** pour le tenant courant. Les réglages SMTP et GPIO/ETau, ainsi que l’activation de la synchronisation OBR, se trouvent dans **Paramètres → Intégrations** (super-administrateur uniquement). Les anciennes valeurs `.env` peuvent être préremplies; enregistrez-les dans l’interface pour les conserver en base.
 
-- LDAP/Active Directory : hôtes, port, TLS, base DN et compte de recherche attendus par `LdapAuthService`.
-- SMTP : hôte, port, chiffrement, identifiants et adresse d’expédition pour les rapports.
-- GPIO : connexion de base source, à configurer séparément dans les fichiers de configuration appropriés.
+Le bouton de test SMTP vérifie uniquement l’ouverture de la connexion au serveur et ne transmet aucun courriel. Si un test d’envoi de message est exceptionnellement nécessaire, son destinataire doit être exclusivement `ezechiel.niyorurema@obr.gov.bi`; ne lancez pas ce test vers d’autres adresses.
+
+Les mots de passe SMTP, GPIO et LDAP sont chiffrés en base. Une clé dédiée est créée dans `writable/keys/integration-settings.key` lors du premier enregistrement d’un secret. Sauvegardez cette clé séparément et protégez-la comme un secret : les valeurs chiffrées ne pourront pas être relues sans elle. La base source GPIO doit rester en lecture seule; AMS écrit uniquement dans sa propre base. La base AMS, Redis, les clés JWT et les autres paramètres de démarrage restent des paramètres d’infrastructure et ne sont pas modifiables depuis l’application.
 - Temps réel : `REDIS_HOST`, `REDIS_PORT`, `REDIS_DATABASE` et, si nécessaire, `REDIS_PASSWORD`. Le serveur Redis doit être accessible par le backend.
 - Frontend : `NEXT_PUBLIC_API_URL`, URL publique du backend; cette valeur est exposée au navigateur.
 
@@ -128,19 +128,37 @@ Les commandes applicatives incluent notamment :
 | `capteurs:sync-users {capteur_id}` | Synchroniser les comptes du terminal |
 | `capteurs:sync-attendance {capteur_id}` | Synchronisation historique des présences |
 | `affectations:sync-capteur {capteur_id}` | Synchroniser les affectations vers le terminal |
+| `gpio:sync-obr --dry-run` | Simuler la synchronisation des employés, unités et mandats du tenant OBR |
+| `gpio:sync-obr` | Appliquer la synchronisation si elle est activée dans Paramètres → Intégrations |
 | `capteurs:scan [capteur_id]` / `capteurs:scan-all` | Scanner un ou plusieurs terminaux |
 | `rapports:envoyer-quotidiens` | Envoyer les rapports planifiés quotidiens |
 | `rapports:envoyer-hebdomadaires` | Envoyer les rapports planifiés hebdomadaires |
 | `rapports:envoyer-mensuels` | Envoyer les rapports planifiés mensuels |
+| `system:jobs:process-retries` | Traiter jusqu’à 20 demandes de relance approuvées, mises en file par un super-administrateur |
+| `system:jobs:prune-history [jours]` | Purger les exécutions terminées au-delà de 90 jours (minimum : 30 jours) |
 | `adms:status`, `adms:diagnostic`, `adms:check-ready` | Diagnostiquer la réception ADMS |
 | `pointages:recalculer-journee {date} --tenant=X [--employe=Y]` | Recalculer les projections quotidiennes |
 | `demo:bout-en-bout` | Démonstration opt-in sur le tenant isolé DEMO |
 | `demo:nettoyer [--force]` | Nettoyer les données du tenant DEMO après confirmation |
 
+### Synchronisation planifiée ETau (tenant OBR)
+
+La commande `gpio:sync-obr` lit `etau_utilisateur`, la hiérarchie ETau et `etau_service_chef`, puis synchronise employés, comptes lecteurs et mandats dans le tenant AMS `1`. Elle ne supprime ni ne réactive automatiquement les employés archivés dans AMS. Les tenants différents de `1` ne sont jamais synchronisés depuis GPIO.
+
+Avant l’activation, configurez l’authentification LDAP/HYBRIDE du tenant OBR, enregistrez les paramètres GPIO dans **Paramètres → Intégrations**, testez la connexion, puis exécutez `php spark gpio:sync-obr --dry-run`. Activez ensuite la synchronisation dans l’interface et planifiez `php spark gpio:sync-obr` via le planificateur système (par exemple Windows Task Scheduler ou cron) à la fréquence voulue. Le planificateur système doit toujours être installé côté serveur; l’application contrôle l’activation à chaque exécution. Un verrou en base refuse les exécutions simultanées.
+
+En simulation, les phases d’affectations et de mandats ne voient pas les employés qui seraient créés; leurs compteurs « introuvable » sont donc recalculés lors de l’application.
+
+Chaque employé importé ou créé par l’API reçoit un compte AMS lié, avec le rôle `lecteur`; les comptes existants et leurs rôles ne sont pas remplacés. Un employé AMS non encore lié est adopté uniquement si son matricule correspond de façon unique; son profil existant n’est pas réécrit pendant cette première liaison, puis les synchronisations suivantes appliquent les mises à jour ETau. Sans email ETau, le compte est créé sans email ni mot de passe local. Au premier login LDAP sous son matricule, AMS valide l’identité auprès de LDAP, lie uniquement un compte lecteur ETau correspondant de façon unique, puis enregistre l’email LDAP sur le compte et le dossier employé. Les mots de passe LDAP ne sont jamais copiés dans AMS.
+
 Consultez `php spark <commande> --help` avant d’exécuter une commande sur une installation réelle. Les commandes de synchronisation contactent des équipements ou systèmes externes.
 Le seeder `php spark db:seed DemoAttendanceRules` crée le tenant isolé DEMO (id 999), y copie 90 pointages et prépare ses contrats/créneaux. Il ne modifie pas le tenant source 1.
 
-Le rapport J-1 se configure dans **Rapports → Rapport automatique J-1** : l’heure par défaut est 08:00 et est évaluée dans le fuseau du tenant; les jours d’envoi suivent `tenants.jours_travailles`. Les mandats actifs reçoivent le rapport de leur unité et de ses sous-unités, et des destinataires supplémentaires peuvent être sélectionnés. Aucun envoi n’est effectué lorsque J-1 est un jour férié. Les envois utilisent le transport SMTP déjà configuré pour AMS et leur contenu est conservé dans l’historique de l’application. Le planificateur système doit exécuter régulièrement `php spark rapports:envoyer-quotidiens` à partir de l’heure configurée.
+Le rapport J-1 se configure dans **Rapports → Rapport automatique J-1** : l’heure par défaut est 08:00 et est évaluée dans le fuseau du tenant; les jours d’envoi suivent `tenants.jours_travailles`. L’interrupteur **Envoi des rapports activé** est le verrou serveur pour tous les courriels de rapport du tenant, planifiés ou manuels; désactivé ou sans configuration enregistrée, aucun courriel de rapport n’est envoyé. Les rapports J-1 sont préparés avec le même destinataire, la même date et le même périmètre pour l’aperçu et l’envoi. Les mandats actifs des superviseurs, chefs de service, directeurs et commissaires reçoivent le rapport de leur unité et de ses sous-unités; des destinataires supplémentaires peuvent être sélectionnés. L’onglet **Rapports J-1 à consulter avant envoi** permet de vérifier le destinataire et le contenu détaillé du rapport sans envoyer de courriel; un superviseur ne voit que ses propres rapports, tandis que les administrateurs/RH du tenant voient la liste du tenant. Aucun envoi automatique n’est effectué lorsque le jour d’exécution n’est pas travaillé ou lorsque J-1 est un jour férié. Les anciennes lignes quotidiennes de `rapports_planifies` sont conservées mais ne sont plus exécutées par la commande quotidienne, qui utilise uniquement le mécanisme J-1 par tenant. Les commandes hebdomadaires et mensuelles restent distinctes pour leur fréquence, mais leur envoi et celui des courriels manuels sont soumis au même interrupteur. Les envois utilisent le transport SMTP déjà configuré pour AMS et leur contenu est conservé dans l’historique de l’application. Le planificateur système doit exécuter régulièrement `php spark rapports:envoyer-quotidiens` à partir de l’heure configurée.
+
+Le panneau super-administrateur **Paramètres → Intégrations** suit les exécutions des rapports, de GPIO et des capteurs. Planifiez aussi `php spark system:jobs:process-retries` (par exemple chaque minute) pour traiter les relances mises en file. Le bouton de relance ne lance pas la tâche immédiatement; le traitement d’une relance de rapport peut envoyer de vrais courriels aux destinataires configurés.
+
+Les rapports J-1 enregistrent dans l’exécution la date, la configuration, le format, la langue, l’éligibilité du jour et les identifiants des destinataires/périmètres. Une relance reprend ce contexte original; les archives déjà envoyées sont ignorées. Une relance partielle garde son état `PARTIAL`. Les exécutions terminées sont conservées 90 jours par défaut; planifiez la purge mensuelle et gardez une sauvegarde conforme à la politique institutionnelle avant toute réduction de cette durée.
 
 ### Temps réel des pointages
 

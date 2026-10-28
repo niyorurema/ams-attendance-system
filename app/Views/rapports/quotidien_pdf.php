@@ -28,6 +28,7 @@
             <tr><td>Absents</td><td><?= (int) ($rapport['stats']['absents'] ?? 0) ?></td><td>Normaux</td><td><?= (int) ($rapport['stats']['normaux'] ?? 0) ?></td></tr>
             <tr><td>Jours fériés</td><td><?= (int) ($rapport['stats']['feries'] ?? 0) ?></td><td>Retards</td><td><?= (int) ($rapport['stats']['retards'] ?? 0) ?></td></tr>
             <tr><td>Repos</td><td><?= (int) ($rapport['stats']['repos'] ?? 0) ?></td><td>Anormaux</td><td><?= (int) ($rapport['stats']['anormaux'] ?? 0) ?></td></tr>
+            <tr><td>Sans jugement</td><td colspan="3"><?= (int) ($rapport['stats']['sans_jugement'] ?? 0) ?></td></tr>
             <tr><td>Heures totales</td><td><?= number_format((float) ($rapport['stats']['heures_totales'] ?? 0), 2, ',', ' ') ?></td><td>Moyenne heures/jour</td><td><?= number_format((float) ($rapport['stats']['moyenne_heures'] ?? 0), 2, ',', ' ') ?></td></tr>
             <tr><td>Taux de présence</td><td colspan="3"><?= number_format((float) ($rapport['stats']['taux_presence'] ?? 0), 2, ',', ' ') ?> %</td></tr>
         </tbody>
@@ -37,8 +38,8 @@
     <table class="details">
         <thead>
             <tr>
-                <th>Date</th><th>Nom employé</th><th>Matricule</th><th>Équipe / service / direction</th>
-                <th>Détails de pointage</th><th>Heures travaillées</th><th>Arrivée en retard</th>
+                <th>Date</th><th>Nom employé</th><th>Matricule</th><th>Équipe / service / direction</th><th>Horaire</th>
+                <th>Détails de pointage</th><th>Statut des créneaux</th><th>Heures travaillées</th><th>Arrivée en retard</th>
                 <th>Départ anticipé</th><th>Retard (min)</th><th>Départ anticipé (min)</th><th>Statut de pointage</th>
             </tr>
         </thead>
@@ -49,10 +50,17 @@
                     <td><?= esc(trim(($detail['nom'] ?? '') . ' ' . ($detail['prenom'] ?? ''))) ?></td>
                     <td><?= esc($detail['matricule'] ?? '') ?></td>
                     <td><?= esc($detail['unite'] ?? '') ?></td>
+                    <td><?= esc($detail['horaire_nom'] ?? '—') ?></td>
                     <td><?= esc(implode(', ', array_map(
                         static fn (array $pointage): string => (string) ($pointage['type'] ?? '')
                             . ' ' . (string) ($pointage['heure'] ?? ''),
                         $detail['pointages'] ?? []
+                    )) ?: '—') ?></td>
+                    <td><?= esc(implode(', ', array_map(
+                        static fn (array $creneau): string => (string) ($creneau['creneau'] ?? '')
+                            . ': ' . (string) ($creneau['statut'] ?? '')
+                            . (($creneau['reel'] ?? null) === null ? '' : ' (' . (string) $creneau['reel'] . ')'),
+                        $detail['creneaux'] ?? []
                     )) ?: '—') ?></td>
                     <td class="number"><?= number_format((float) ($detail['heures_travaillees'] ?? 0), 2, ',', ' ') ?></td>
                     <td><?= esc($detail['arrivee_tardive'] ?? '—') ?></td>
@@ -62,6 +70,7 @@
                     <td><?= esc(match ($detail['statut'] ?? '') {
                         'FERIE' => 'Jour férié',
                         'REPOS' => 'Repos',
+                        'SANS_JUGEMENT' => 'Sans jugement',
                         default => $detail['statut'] ?? '',
                     }) ?></td>
                 </tr>

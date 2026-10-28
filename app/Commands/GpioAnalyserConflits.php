@@ -4,7 +4,7 @@ namespace App\Commands;
 
 use CodeIgniter\CLI\BaseCommand;
 use CodeIgniter\CLI\CLI;
-use Config\Database;
+use App\Services\ApplicationIntegrationSettings;
 use RuntimeException;
 use Throwable;
 
@@ -39,7 +39,7 @@ class GpioAnalyserConflits extends BaseCommand
                 throw new RuntimeException('Tenant AMS introuvable.');
             }
 
-            $services = Database::connect('gpio', false)->table('etau_service')->get()->getResultArray();
+            $services = (new ApplicationIntegrationSettings())->gpioConnection()->table('etau_service')->get()->getResultArray();
             if ($services === []) {
                 CLI::write('Aucun service GPIO trouvé.');
 

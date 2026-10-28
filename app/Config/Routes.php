@@ -25,15 +25,27 @@ $routes->group('api', ['filter' => 'jwt'], static function ($routes): void {
 	$routes->post('auth/ldap/sync-users', 'Api\\AuthController::ldapSyncUsers');
 	$routes->get('admin/tenants', 'Api\\AdminTenantsController::index');
 	$routes->get('admin/dashboard/kpis', 'Api\\DashboardController::kpis');
+	$routes->get('admin/system/jobs', 'Api\\SystemJobsController::index');
+	$routes->post('admin/system/jobs/(:num)/retry', 'Api\\SystemJobsController::retry/$1');
 	$routes->get('admin/tenants/(:num)', 'Api\\AdminTenantsController::show/$1');
 	$routes->post('admin/tenants', 'Api\\AdminTenantsController::create');
 	$routes->put('admin/tenants/(:num)', 'Api\\AdminTenantsController::update/$1');
 	$routes->delete('admin/tenants/(:num)', 'Api\\AdminTenantsController::delete/$1');
 	$routes->get('admin/tenant', 'Api\\TenantConfigController::show');
 	$routes->put('admin/tenant', 'Api\\TenantConfigController::update');
+	$routes->get('admin/tenant/ldap', 'Api\\IntegrationSettingsController::ldap');
+	$routes->put('admin/tenant/ldap', 'Api\\IntegrationSettingsController::updateLdap');
+	$routes->post('admin/tenant/ldap/employees/email-preview', 'Api\\IntegrationSettingsController::previewEmployeeEmails');
+	$routes->post('admin/tenant/ldap/employees/email-apply', 'Api\\IntegrationSettingsController::applyEmployeeEmails');
+	$routes->get('admin/integrations', 'Api\\IntegrationSettingsController::system');
+	$routes->put('admin/integrations', 'Api\\IntegrationSettingsController::updateSystem');
+	$routes->post('admin/integrations/smtp/test', 'Api\\IntegrationSettingsController::testSmtp');
+	$routes->post('admin/integrations/gpio/test', 'Api\\IntegrationSettingsController::testGpio');
 	$routes->get('admin/tenant/pointage-parametres', 'Api\\TenantConfigController::pointageParametres');
 	$routes->put('admin/tenant/pointage-parametres', 'Api\\TenantConfigController::mettreAJourPointageParametres');
 	$routes->post('admin/tenant/logo', 'Api\\TenantConfigController::uploadLogo');
+	$routes->get('employes/export/excel', 'Api\\EmployesController::exportExcel');
+	$routes->get('employes/export/pdf', 'Api\\EmployesController::exportPdf');
 	$routes->get('users', 'Api\\UsersController::index');
 	$routes->get('users/(:num)', 'Api\\UsersController::show/$1');
 	$routes->post('users', 'Api\\UsersController::create');
@@ -78,6 +90,8 @@ $routes->group('api', ['filter' => 'jwt'], static function ($routes): void {
 
 	$routes->get('pointages', 'Api\PointagesController::index');
 	$routes->post('pointages', 'Api\\PointagesController::create');
+	$routes->post('pointages/journee/comparer-regles', 'Api\\PointagesController::comparerReglesJournee');
+	$routes->post('pointages/journee/recalculer', 'Api\\PointagesController::recalculerJournee');
 	$routes->post('pointages/(:num)/recalculer', 'Api\\PointagesController::recalculer/$1');
 	$routes->get('pointages/stats', 'Api\PointagesController::stats');
 	$routes->get('pointages/stats/presence', 'Api\PointagesController::statsPresence');
@@ -118,6 +132,8 @@ $routes->group('api', ['filter' => 'jwt'], static function ($routes): void {
 	$routes->post('rapports/quotidien/envoyer', 'Api\\RapportsController::envoyer');
 	$routes->get('rapports/journalier/configuration', 'Api\\RapportsController::configurationJournaliere');
 	$routes->put('rapports/journalier/configuration', 'Api\\RapportsController::enregistrerConfigurationJournaliere');
+	$routes->get('rapports/journalier/apercus', 'Api\\RapportsController::apercusJournaliers');
+	$routes->get('rapports/journalier/apercu', 'Api\\RapportsController::apercuJournalier');
 	$routes->get('rapports/historique', 'Api\\RapportsController::historique');
 	$routes->get('rapports/historique/(:num)', 'Api\\RapportsController::historiqueDetail/$1');
 	$routes->get('rapports/planifies', 'Api\\RapportsController::planifies');

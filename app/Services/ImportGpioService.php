@@ -20,8 +20,214 @@ final class ImportGpioService
 
     public function __construct(?BaseConnection $gpioDb = null, ?BaseConnection $amsDb = null)
     {
-        $this->gpioDb = $gpioDb ?? Database::connect('etau', false);
+        $this->gpioDb = $gpioDb ?? (new ApplicationIntegrationSettings())->gpioConnection();
         $this->amsDb = $amsDb ?? Database::connect();
+    }
+
+    /**
+     * Synchronise tous les utilisateurs-personnes ETau dans le tenant OBR.
+     *
+     * @return array{lues:int,crees:int,maj:int,ignores:int,erreurs:int,comptes_a_creer:int,raisons:array<string,int>,details:list<string>}
+     */
+    public function synchroniserEmployes(int $tenantId, bool $dryRun = true): array
+    {
+        if ($tenantId !== 1) {
+            throw new RuntimeException('La synchronisation ETau est réservée au tenant OBR #1.');
+        }
+        $this->verifierTenant($tenantId);
+
+        $rows = $this->gpioDb->table('etau_utilisateur')->get()->getResultArray();
+        $typeColumn = $this->colonne($rows, ['typeObjet', 'type_objet']);
+        $idColumn = $this->colonne($rows, ['utilisateur_id', 'utilisateurID', 'userID', 'id_utilisateur', 'id']);
+        if ($rows !== [] && ($typeColumn === null || $idColumn === null)) {
+            throw new RuntimeException('Schéma GPIO etau_utilisateur incompatible : utilisateur_id et typeObjet sont requis.');
+        }
+
+        $rows = array_values(array_filter(
+            $rows,
+            static fn (array $row): bool => strtoupper(trim((string) ($row[$typeColumn] ?? ''))) === 'U'
+        ));
+        $stats = $this->nouvellesStats(count($rows));
+        $stats['comptes_a_creer'] = 0;
+        if ($rows === []) {
+            return $stats;
+        }
+
+        $activeColumn = $this->colonne($rows, ['utilisateur_active', 'actif', 'status']);
+        $matriculeColumn = $this->colonne($rows, ['matricule', 'employee_id', 'numero_matricule']);
+        $nomColumn = $this->colonne($rows, ['nom', 'lastname', 'last_name']);
+        $prenomColumn = $this->colonne($rows, ['prenom', 'firstname', 'first_name']);
+        $emailColumn = $this->colonne($rows, ['email', 'mail', 'courriel', 'email_address']);
+        $telephoneColumn = $this->colonne($rows, ['telephone', 'phone', 'telephone_number']);
+        $badgeColumn = $this->colonne($rows, ['badge_id', 'badgeID', 'id_badge', 'badge']);
+        if ($nomColumn === null || $prenomColumn === null) {
+            throw new RuntimeException('Schéma GPIO etau_utilisateur incompatible : nom et prenom sont requis.');
+        }
+
+        $accounts = new EmployeAccountService($this->amsDb);
+        foreach ($rows as $row) {
+            $sourceId = trim((string) $row[$idColumn]);
+            if (! ctype_digit($sourceId) || (int) $sourceId < 1 || (float) $sourceId > 4294967295) {
+                $stats['erreurs']++;
+                $this->ajouterRaisonIgnore($stats, 'identifiant_gpio_invalide', 'Un utilisateur ETau a un identifiant source invalide.');
+                continue;
+            }
+            $sourceId = (string) (int) $sourceId;
+
+            $nom = trim((string) ($row[$nomColumn] ?? ''));
+            $prenom = trim((string) ($row[$prenomColumn] ?? ''));
+            if ($nom === '' || $prenom === '') {
+                $stats['erreurs']++;
+                $this->ajouterRaisonIgnore($stats, 'nom_incomplet', 'Un utilisateur ETau sans nom ou prénom n’a pas été importé.');
+                continue;
+            }
+
+            $matricule = $matriculeColumn === null ? '' : trim((string) ($row[$matriculeColumn] ?? ''));
+            if ($matricule === '') {
+                $matricule = 'ETAU-' . $sourceId;
+            }
+            if (mb_strlen($matricule) > 50) {
+                $stats['erreurs']++;
+                $this->ajouterRaisonIgnore($stats, 'matricule_trop_long', 'Un matricule ETau dépasse la longueur maximale AMS.');
+                continue;
+            }
+
+            $email = $emailColumn === null ? '' : strtolower(trim((string) ($row[$emailColumn] ?? '')));
+            if ($email !== '' && (filter_var($email, FILTER_VALIDATE_EMAIL) === false || mb_strlen($email) > 150)) {
+                log_message('warning', 'Email ETau invalide ignoré pour l’utilisateur source #{source_id}; compte créé sans email.', [
+                    'source_id' => $sourceId,
+                ]);
+                $stats['details'][] = sprintf('Utilisateur ETau %s : email invalide ignoré, compte créé sans email.', $sourceId);
+                $email = '';
+            }
+            $telephone = $telephoneColumn === null ? '' : trim((string) ($row[$telephoneColumn] ?? ''));
+            $actif = $activeColumn === null ? 1 : ((int) $row[$activeColumn] === 1 ? 1 : 0);
+
+            $existing = $this->amsDb->table('employes')
+                ->where('tenant_id', $tenantId)
+                ->where('source_systeme', self::SOURCE_SYSTEME)
+                ->where('source_id', (int) $sourceId)
+                ->get()
+                ->getResultArray();
+            $adopted = false;
+            if (count($existing) > 1) {
+                $stats['erreurs']++;
+                $this->ajouterRaisonIgnore($stats, 'source_gpio_dupliquee', 'Plusieurs employés AMS portent le même identifiant source ETau.');
+                continue;
+            }
+            $employee = $existing[0] ?? null;
+            if ($employee === null) {
+                $matricules = $this->amsDb->table('employes')
+                    ->where('tenant_id', $tenantId)
+                    ->where('matricule', $matricule)
+                    ->where('deleted_at', null)
+                    ->get()
+                    ->getResultArray();
+                if (count($matricules) === 1
+                    && ($matricules[0]['source_systeme'] ?? null) === null
+                    && ($matricules[0]['source_id'] ?? null) === null
+                ) {
+                    $employee = $matricules[0];
+                    $adopted = true;
+                } elseif ($matricules !== []) {
+                    $stats['erreurs']++;
+                    $this->ajouterRaisonIgnore($stats, 'matricule_deja_utilise', 'Un matricule ETau existe déjà dans AMS sans lien source vérifiable.');
+                    continue;
+                }
+            } elseif ($employee['deleted_at'] !== null) {
+                $stats['ignores']++;
+                $this->ajouterRaisonIgnore($stats, 'employe_archive', 'Un employé ETau archivé dans AMS n’a pas été réactivé automatiquement.');
+                continue;
+            }
+
+            $badgeId = $employee === null ? null : (int) $employee['badge_id'];
+            if ($badgeId === null) {
+                $candidateBadge = $badgeColumn === null ? $sourceId : trim((string) ($row[$badgeColumn] ?? ''));
+                $badgeId = ctype_digit($candidateBadge) && (int) $candidateBadge > 0 && (float) $candidateBadge <= 4294967295
+                    ? (int) $candidateBadge
+                    : (int) $sourceId;
+                $badgeOwner = $this->amsDb->table('employes')
+                    ->where('tenant_id', $tenantId)
+                    ->where('badge_id', $badgeId)
+                    ->where('deleted_at', null)
+                    ->get()
+                    ->getRowArray();
+                if ($badgeOwner !== null) {
+                    $stats['erreurs']++;
+                    $this->ajouterRaisonIgnore($stats, 'badge_deja_utilise', 'Le badge prévu pour un utilisateur ETau est déjà associé à un autre employé AMS.');
+                    continue;
+                }
+            }
+
+            $data = [
+                'tenant_id' => $tenantId,
+                'matricule' => $matricule,
+                'badge_id' => $badgeId,
+                'user_id_capteur' => (string) ($employee['user_id_capteur'] ?? $sourceId),
+                'nom' => $nom,
+                'prenom' => $prenom,
+                'telephone' => $telephone !== '' ? mb_substr($telephone, 0, 30) : ($employee['telephone'] ?? null),
+                'actif' => $actif,
+                'source_id' => (int) $sourceId,
+                'source_systeme' => self::SOURCE_SYSTEME,
+                'updated_at' => date('Y-m-d H:i:s'),
+            ];
+            if ($email !== '') {
+                $data['email'] = $email;
+            } elseif ($employee === null) {
+                $data['email'] = null;
+            }
+            if ($adopted) {
+                $data = [
+                    'source_id' => (int) $sourceId,
+                    'source_systeme' => self::SOURCE_SYSTEME,
+                    'updated_at' => date('Y-m-d H:i:s'),
+                ];
+            }
+
+            if ($employee === null) {
+                $data['empreinte_enrolee'] = 0;
+                $data['nb_empreintes'] = 0;
+                $data['role_capteur'] = 0;
+                $data['created_at'] = date('Y-m-d H:i:s');
+                if (! $dryRun && ! $this->amsDb->table('employes')->insert($data)) {
+                    throw new RuntimeException('Insertion d’un employé ETau refusée par AMS.');
+                }
+                $stats['crees']++;
+                if (! $dryRun) {
+                    $employeeId = (int) $this->amsDb->insertID();
+                    $employee = $this->amsDb->table('employes')->where('id', $employeeId)->get()->getRowArray();
+                    if ($employee === null) {
+                        throw new RuntimeException('Employé ETau créé mais introuvable après insertion.');
+                    }
+                } else {
+                    $stats['comptes_a_creer']++;
+                    continue;
+                }
+            } else {
+                if (! $dryRun && ! $this->amsDb->table('employes')->where('id', (int) $employee['id'])->update($data)) {
+                    throw new RuntimeException('Mise à jour d’un employé ETau refusée par AMS.');
+                }
+                $stats['maj']++;
+                if ($dryRun) {
+                    $accountExists = $this->amsDb->table('users')
+                        ->where('tenant_id', $tenantId)
+                        ->where('employe_id', (int) $employee['id'])
+                        ->countAllResults() > 0;
+                    if (! $accountExists) {
+                        $stats['comptes_a_creer']++;
+                    }
+                    continue;
+                }
+                $employee = array_merge($employee, $data);
+            }
+
+            if ($accounts->ensureReaderAccount($employee, $tenantId)) {
+                $stats['comptes_a_creer']++;
+            }
+        }
+
+        return $stats;
     }
 
     /**

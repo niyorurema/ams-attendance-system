@@ -18,14 +18,12 @@ trait AttendanceDatabaseTestTrait
     protected function setUpAttendanceDatabase(): void
     {
         $this->attendanceDb = Database::connect('tests');
-        if (! $this->attendanceDb->tableExists('tenants')) {
-            $migrations = new MigrationRunner(config(Migrations::class), 'tests');
-            $migrations->setNamespace('App');
-            if (! $migrations->latest()) {
-                throw new RuntimeException('Impossible de préparer le schéma applicatif de la base ams_test.');
-            }
+        $migrations = new MigrationRunner(config(Migrations::class), 'tests');
+        $migrations->setNamespace('App');
+        if (! $migrations->latest()) {
+            throw new RuntimeException('Impossible de préparer le schéma applicatif de la base ams_test.');
         }
-        foreach (['tenants', 'employes', 'employe_contrats_horaire', 'tenant_creneaux_pointage', 'pointages', 'pointages_journee'] as $table) {
+        foreach (['tenants', 'employes', 'employe_contrats_horaire', 'tenant_creneaux_pointage', 'tenant_regles_pointage_versions', 'pointages', 'pointages_journee'] as $table) {
             if (! $this->attendanceDb->tableExists($table)) {
                 throw new RuntimeException('Le schéma applicatif de la base ams_test est incomplet : table ' . $table . ' absente.');
             }

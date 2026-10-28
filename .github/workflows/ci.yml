@@ -1,0 +1,60 @@
+name: Backend CI
+
+on:
+  push:
+    paths:
+      - '**.php'
+      - 'composer.json'
+      - 'composer.lock'
+      - 'phpunit.dist.xml'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - '**.php'
+      - 'composer.json'
+      - 'composer.lock'
+      - 'phpunit.dist.xml'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  phpunit:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: ams_test
+          MYSQL_USER: ams_test
+          MYSQL_PASSWORD: ams_test_password
+          MYSQL_ROOT_PASSWORD: root_test_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u root -proot_test_password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: curl, fileinfo, gd, intl, mbstring, mysqli, pcntl, pdo_sqlite, sqlite3, zip
+          coverage: none
+      - uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-
+      - run: composer install --no-interaction --prefer-dist
+      - run: vendor/bin/phpunit --no-coverage
+        env:
+          AMS_MYSQL_TESTS: '1'
+          AMS_MYSQL_TEST_HOST: 127.0.0.1
+          AMS_MYSQL_TEST_PORT: 3306
+          AMS_MYSQL_TEST_DATABASE: ams_test
+          AMS_MYSQL_TEST_USER: ams_test
+          AMS_MYSQL_TEST_PASSWORD: ams_test_password

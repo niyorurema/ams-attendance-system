@@ -78,6 +78,21 @@ final class DashboardControllerTest extends CIUnitTestCase
         $this->assertSame(1, $employes['sans_pointage_depart']);
     }
 
+    public function testJourneeEnCoursNestPasComptabiliseeCommeAbsence(): void
+    {
+        $stats = DashboardKpiService::calculerPresenceJour(
+            [10, 11],
+            [
+                10 => ['heure_arrivee' => null, 'statut_global' => 'EN_COURS'],
+                11 => ['heure_arrivee' => null, 'statut_global' => 'ABSENT'],
+            ]
+        );
+
+        $this->assertSame(1, $stats['en_cours']);
+        $this->assertSame(1, $stats['absents']);
+        $this->assertSame(0, $stats['presents']);
+    }
+
     public function testEvolutionAndRecentPointagesUseRawEventsWhenContractsAreNotConfigured(): void
     {
         $date = (new DateTimeImmutable('now', new \DateTimeZone('Africa/Bujumbura')))->format('Y-m-d');

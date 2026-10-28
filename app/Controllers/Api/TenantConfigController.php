@@ -3,6 +3,7 @@
 namespace App\Controllers\Api;
 
 use App\Models\TenantModel;
+use App\Services\AttendanceRuleVersionService;
 use App\Services\ParametragePointageService;
 use CodeIgniter\HTTP\ResponseInterface;
 use Config\Database;
@@ -150,7 +151,17 @@ class TenantConfigController extends BaseApiController
             return $this->authorizationError();
         }
 
-        return $this->successResponse($this->configurationPointage($tenantId));
+        $horaireId = $this->request->getGet('horaire_id');
+        if ($horaireId !== null
+            && (filter_var($horaireId, FILTER_VALIDATE_INT) === false || (int) $horaireId < 1)
+        ) {
+            return $this->errorResponse('Identifiant d’horaire invalide.', 400);
+        }
+
+        return $this->successResponse($this->configurationPointage(
+            $tenantId,
+            $horaireId === null ? null : (int) $horaireId
+        ));
     }
 
     /** Met à jour un ensemble de paramètres de pointage déjà déclarés par le service. */
@@ -170,7 +181,7 @@ class TenantConfigController extends BaseApiController
         }
 
         $input = $this->jsonInput();
-        $champsAutorises = ['parametres', 'creneaux', 'actif_regles_nouvelles'];
+        $champsAutorises = ['parametres', 'creneaux', 'actif_regles_nouvelles', 'horaire_id', 'date_effet'];
         if ($input === [] || array_diff(array_keys($input), $champsAutorises) !== []) {
             return $this->errorResponse('Configuration de pointage invalide ou vide.', 400);
         }
@@ -185,6 +196,54 @@ class TenantConfigController extends BaseApiController
         }
         if ($modifierOptIn && ! in_array($input['actif_regles_nouvelles'], [0, 1, '0', '1', false, true], true)) {
             return $this->errorResponse('La valeur d’activation doit être booléenne.', 422);
+        }
+
+        if (array_key_exists('date_effet', $input) || array_key_exists('horaire_id', $input)) {
+            $horaireId = $input['horaire_id'] ?? null;
+            if ($horaireId !== null && (filter_var($horaireId, FILTER_VALIDATE_INT) === false || (int) $horaireId < 1)) {
+                return $this->errorResponse('Identifiant d’horaire invalide.', 422);
+            }
+            $dateEffet = $input['date_effet'] ?? date('Y-m-d');
+            if (! is_string($dateEffet) || ! $this->datePointageValide($dateEffet)) {
+                return $this->errorResponse('Date d’effet invalide.', 422);
+            }
+            if ($parametres === [] || ! is_array($creneaux)) {
+                return $this->errorResponse('Les paramètres et les créneaux doivent être transmis ensemble.', 422);
+            }
+            foreach ($creneaux as $creneau) {
+                if (! is_array($creneau)) {
+                    return $this->errorResponse('Chaque créneau doit être un objet.', 422);
+                }
+            }
+            try {
+                $configurationActuelle = $this->configurationPointage(
+                    $tenantId,
+                    $horaireId === null ? null : (int) $horaireId
+                );
+                (new AttendanceRuleVersionService(Database::connect()))->enregistrer(
+                    $tenantId,
+                    $horaireId === null ? null : (int) $horaireId,
+                    $dateEffet,
+                    $modifierOptIn
+                        ? in_array($input['actif_regles_nouvelles'], [1, '1', true], true)
+                        : (bool) $configurationActuelle['actif_regles_nouvelles'],
+                    $parametres,
+                    $creneaux
+                );
+            } catch (\InvalidArgumentException|\UnexpectedValueException $exception) {
+                return $this->errorResponse($exception->getMessage(), 422);
+            } catch (Throwable $exception) {
+                log_message('error', 'Échec de création d’une version des règles de pointage: {message}', [
+                    'message' => $exception->getMessage(),
+                ]);
+
+                return $this->errorResponse('Impossible de créer la version des règles de pointage.', 500);
+            }
+
+            return $this->successResponse($this->configurationPointage(
+                $tenantId,
+                $horaireId === null ? null : (int) $horaireId
+            ), 'Version des règles de pointage enregistrée.');
         }
 
         $db = Database::connect();
@@ -215,6 +274,37 @@ class TenantConfigController extends BaseApiController
                 if (! is_array($creneau)) {
                     return $this->errorResponse('Chaque créneau doit être un objet.', 422);
                 }
+            }
+        }
+        $tenantEtat = $db->table('tenants')
+            ->select('actif_regles_nouvelles')
+            ->where('id', $tenantId)
+            ->where('deleted_at', null)
+            ->get()
+            ->getRowArray();
+        $reglesFinalementActives = $modifierOptIn
+            ? in_array($input['actif_regles_nouvelles'], [1, '1', true], true)
+            : (int) ($tenantEtat['actif_regles_nouvelles'] ?? 0) === 1;
+        if ($reglesFinalementActives) {
+            $creneauxFinaux = array_key_exists('creneaux', $input) ? $creneaux : $service->getCreneaux($tenantId);
+            try {
+                $configurationFinale = (new AttendanceRuleVersionService($db))->preparer(
+                    $tenantId,
+                    null,
+                    true,
+                    $valeursParametres,
+                    $creneauxFinaux
+                );
+                if (! $this->creneauxPauseComplets($configurationFinale['creneaux'])
+                    && $configurationFinale['pointages_pause_observes']
+                ) {
+                    return $this->errorResponse(
+                        'Des pointages de pause ont été observés récemment. Configurez les deux créneaux de pause avant l’activation.',
+                        422
+                    );
+                }
+            } catch (\InvalidArgumentException|\UnexpectedValueException $exception) {
+                return $this->errorResponse($exception->getMessage(), 422);
             }
         }
 
@@ -253,7 +343,7 @@ class TenantConfigController extends BaseApiController
     }
 
     /** @return array<string, mixed> */
-    private function configurationPointage(int $tenantId): array
+    private function configurationPointage(int $tenantId, ?int $horaireId = null): array
     {
         $db = Database::connect();
         $tenant = $db->table('tenants')
@@ -267,12 +357,41 @@ class TenantConfigController extends BaseApiController
         }
 
         $service = new ParametragePointageService($db);
+        $versions = new AttendanceRuleVersionService($db);
+        $version = $versions->getApplicable($tenantId, date('Y-m-d'), $horaireId);
+        $parametres = $service->getConfiguration($tenantId);
+        if ($version !== null) {
+            foreach ($version['parametres'] as $cle => $valeur) {
+                if (isset($parametres[$cle])) {
+                    $parametres[$cle]['valeur'] = $valeur;
+                }
+            }
+        }
 
         return [
-            'actif_regles_nouvelles' => (bool) $tenant['actif_regles_nouvelles'],
-            'parametres' => $service->getConfiguration($tenantId),
-            'creneaux' => $service->getCreneaux($tenantId),
+            'actif_regles_nouvelles' => $version['actif'] ?? (bool) $tenant['actif_regles_nouvelles'],
+            'parametres' => $parametres,
+            'creneaux' => $version['creneaux'] ?? $service->getCreneaux($tenantId),
+            'horaires' => $versions->getHoraires($tenantId),
+            'horaire_id' => $horaireId,
+            'date_effet' => $version['date_effet'] ?? date('Y-m-d'),
+            'versions' => $versions->getHistorique($tenantId, $horaireId),
         ];
+    }
+
+    private function datePointageValide(string $date): bool
+    {
+        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d', $date);
+
+        return $parsed !== false && $parsed->format('Y-m-d') === $date;
+    }
+
+    /** @param array<int, array<string, mixed>> $creneaux */
+    private function creneauxPauseComplets(array $creneaux): bool
+    {
+        $types = array_column($creneaux, 'type_creneau');
+
+        return in_array('DEBUT_PAUSE', $types, true) && in_array('FIN_PAUSE', $types, true);
     }
 
     /** Téléverse et valide le logo du tenant courant. */

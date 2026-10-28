@@ -60,4 +60,61 @@ final class RapportServiceTest extends CIUnitTestCase
         $this->assertNull($service->arrival($analyse));
         $this->assertNull($service->earlyDeparture($analyse));
     }
+
+    public function testToutesLesEntreesQuotidiennesUtilisentLeTraitementJ1Unique(): void
+    {
+        $service = new class extends RapportService {
+            public int $preparations = 0;
+
+            public function __construct()
+            {
+            }
+
+            public function contexteRapportsQuotidiens(): array
+            {
+                $this->preparations++;
+
+                return [];
+            }
+        };
+
+        $resultatCommande = $service->envoyerRapportsQuotidiens();
+        $resultatType = $service->envoyerRapportsParType('QUOTIDIEN');
+
+        $this->assertSame(['traite' => 0, 'envoyes' => 0, 'ignores' => 0, 'erreurs' => 0], $resultatCommande);
+        $this->assertSame($resultatCommande, $resultatType);
+        $this->assertSame(2, $service->preparations);
+    }
+
+    public function testPreparationUnitaireDelegueAuMemeGenerateurAvecLePerimetre(): void
+    {
+        $service = new class extends RapportService {
+            /** @var array{int,string,string,?int}|null */
+            public ?array $arguments = null;
+
+            public function __construct()
+            {
+            }
+
+            public function genererRapportQuotidien(
+                int $userId,
+                string $date,
+                ?string $dateMandat = null,
+                ?int $uniteScopeId = null
+            ): array {
+                $this->arguments = [$userId, $date, (string) $dateMandat, $uniteScopeId];
+
+                return ['date' => $date];
+            }
+        };
+
+        $rapport = $service->preparerRapportPourDestinataire(
+            ['user_id' => 42, 'unite_id' => 17],
+            '2026-10-23',
+            '2026-10-24'
+        );
+
+        $this->assertSame(['date' => '2026-10-23'], $rapport);
+        $this->assertSame([42, '2026-10-23', '2026-10-24', 17], $service->arguments);
+    }
 }

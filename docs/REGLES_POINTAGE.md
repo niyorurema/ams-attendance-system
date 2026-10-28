@@ -28,9 +28,35 @@ ABSENT > HORS_CRENEAU > INCOMPLET > RETARD > ANTICIPE > ANORMAL > PRESENT
 ```
 
 La valeur système par défaut de `ecart_max_association_minutes` est de 360
-minutes. Elle ne s'applique qu'aux tenants sans valeur enregistrée; le
-réinitialiseur idempotent et le seeder n'écrasent pas les valeurs personnalisées
-existantes.
+minutes. Elle limite l'association des arrivées anticipées, des départs
+anticipés et des pointages proches de leur cible; une arrivée avant l'heure
+attendue et un départ après l'heure attendue ne sont pas bornés par cette
+limite. Une sortie du jour peut être associée jusqu'à l'heure de début du
+service suivant, le lendemain. Les pointages de cette fenêtre qui ne sont pas
+des `CHECK_OUT` ne sont pas absorbés dans la journée précédente.
+
+Pour le profil OBR, les créneaux recommandés sont : arrivée à 07:30 avec
+10 minutes de tolérance (une arrivée anticipée n'est pas pénalisée), départ en
+pause à 12:00 avec `LIMITE_PRECOCE` et tolérance nulle, retour à 14:00 avec
+`LIMITE_TARDIVE` et 10 minutes de tolérance, puis départ à 17:30 avec
+`LIMITE_PRECOCE` et tolérance nulle. L'horaire OBR utilise les plages
+00:00–07:30, 12:00–12:01, 14:00–14:01 et 17:30–23:59 comme plages de
+référence; les plages d'une minute de pause sont un artifice de validation,
+pas une tolérance supplémentaire. La tolérance de retour est indépendante de
+la plage et de la durée maximale de pause.
+
+La durée maximale de pause recommandée est de 130 minutes : une pause partant
+à 12:00 et dont le retour est toléré jusqu'à 14:10 ne dépasse alors pas le
+maximum. Le défaut système est 130 minutes. Les autres tenants ayant une valeur
+enregistrée ne sont pas modifiés automatiquement.
+
+Les shifts traversant minuit sont calculés sur la date de début du shift. Leur
+sortie attendue est rattachée au lendemain et les pointages de la pause sont
+déduits des heures travaillées lorsqu'ils forment une paire réelle. Le modèle
+actuel des shifts ne contient pas d'heures de pause; les pauses des shifts ne
+sont donc pas jugées selon les créneaux OBR de 12:00 et 14:00. Des règles de
+pause propres à chaque shift nécessiteraient d'ajouter et de configurer ces
+créneaux dans le modèle des shifts.
 
 Les heures supplémentaires sont calculées après le seuil configuré. Le mode
 `ARRONDI` arrondit au multiple le plus proche de

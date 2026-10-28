@@ -191,6 +191,38 @@ class Database extends Config
     ];
 
     /**
+     * Connexion MySQL isolée utilisée uniquement par les tests d’intégration concurrents.
+     *
+     * @var array<string, mixed>
+     */
+    public array $mysqltests = [
+        'DSN'          => '',
+        'hostname'     => '127.0.0.1',
+        'username'     => 'ams_test',
+        'password'     => '',
+        'database'     => 'ams_test',
+        'DBDriver'     => 'MySQLi',
+        'DBPrefix'     => '',
+        'pConnect'     => false,
+        'DBDebug'      => true,
+        'charset'      => 'utf8mb4',
+        'DBCollat'     => 'utf8mb4_unicode_ci',
+        'swapPre'      => '',
+        'encrypt'      => false,
+        'compress'     => false,
+        'strictOn'     => true,
+        'failover'     => [],
+        'port'         => 3306,
+        'numberNative' => false,
+        'foundRows'    => false,
+        'dateFormat'   => [
+            'date'     => 'Y-m-d',
+            'datetime' => 'Y-m-d H:i:s',
+            'time'     => 'H:i:s',
+        ],
+    ];
+
+    /**
      * Connexion à la base source GPIO (OBR) - serveur séparé.
      *
      * Utilisée en lecture seule pour importer la hiérarchie organisationnelle
@@ -200,10 +232,10 @@ class Database extends Config
      */
     public array $gpio = [
         'DSN'          => '',
-        'hostname'     => '10.100.10.21',
-        'username'     => 'ams_gpio',
-        'password'     => 'Ezec1993@',
-        'database'     => 'etau',
+        'hostname'     => '',
+        'username'     => '',
+        'password'     => '',
+        'database'     => '',
         'DBDriver'     => 'MySQLi',
         'DBPrefix'     => '',
         'pConnect'     => false,
@@ -262,9 +294,18 @@ class Database extends Config
             $this->tests['DBDriver'] = 'App\\Database\\MySQLi';
         }
 
+        $this->mysqltests['hostname'] = env('AMS_MYSQL_TEST_HOST', $this->mysqltests['hostname']);
+        $this->mysqltests['username'] = env('AMS_MYSQL_TEST_USER', $this->mysqltests['username']);
+        $this->mysqltests['password'] = env('AMS_MYSQL_TEST_PASSWORD', $this->mysqltests['password']);
+        $this->mysqltests['database'] = env('AMS_MYSQL_TEST_DATABASE', $this->mysqltests['database']);
+        $this->mysqltests['DBPrefix'] = env('AMS_MYSQL_TEST_PREFIX', $this->mysqltests['DBPrefix']);
+        $this->mysqltests['port'] = (int) env('AMS_MYSQL_TEST_PORT', $this->mysqltests['port']);
+        $this->mysqltests['DBDriver'] = 'App\\Database\\MySQLi';
+
         $this->gpio['hostname'] = env('GPIO_DB_HOSTNAME', $this->gpio['hostname']);
         $this->gpio['username'] = env('GPIO_DB_USERNAME', $this->gpio['username']);
         $this->gpio['password'] = env('GPIO_DB_PASSWORD', $this->gpio['password']);
+        $this->gpio['database'] = env('GPIO_DB_DATABASE', $this->gpio['database']);
         $this->gpio['port'] = (int) env('GPIO_DB_PORT', $this->gpio['port']);
 
         // Ensure that we always set the database group to 'tests' if

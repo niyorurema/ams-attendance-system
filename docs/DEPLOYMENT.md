@@ -2,7 +2,7 @@
 
 ## État des artefacts
 
-Le backend est une application CodeIgniter 4 dans `ams`; le frontend Next.js est dans le dépôt frère `ams-frontend`. Aucun `Dockerfile`, `docker-compose.yml` ou workflow CI/CD n’est présent dans ces dépôts au moment de cette documentation. Les commandes ci-dessous sont des recommandations à adapter, pas une procédure déjà validée sur un VPS.
+Le backend est une application CodeIgniter 4 dans `ams`; le frontend Next.js est dans le dépôt frère `ams-frontend`. Des workflows GitHub Actions de validation backend/frontend sont fournis; aucun déploiement automatique ni fichier Docker n’est livré. Les commandes ci-dessous sont des recommandations à adapter, pas une procédure déjà validée sur un VPS.
 
 ## Préparer le serveur
 
@@ -33,15 +33,41 @@ composer install --no-dev --prefer-dist --optimize-autoloader
 php spark migrate
 ```
 
+La migration `2026-10-26-000003_CreateAttendanceRuleVersionsTable` ajoute l’historique immuable des règles par horaire et date d’effet. Vérifiez son application avec `php spark migrate:status` avant d’utiliser **Paramètres → Pointages**. Elle ne remplace pas les règles historiques; les tenants sans version applicable conservent le calcul de repli.
+
+Pour activer un nouveau profil, sélectionnez d’abord un horaire, configurez ses créneaux et sa date d’effet, puis comparez les résultats sur une période d’essai (31 jours maximum) avant de confirmer un recalcul. La comparaison ne persiste pas de projection. Les anciennes dates restent liées à la version applicable à leur date d’effet; ne modifiez pas les snapshots directement en base.
+
 Définissez au minimum :
 
 - `CI_ENVIRONMENT = production`;
 - `app.baseURL` sur l’URL HTTPS publique de l’API;
 - paramètres `database.default.*`;
 - `JWT_SECRET` (secret aléatoire privé d’au moins 32 caractères) et `JWT_TTL`;
-- paramètres LDAP, SMTP et GPIO uniquement lorsqu’ils sont nécessaires.
+- paramètres LDAP, SMTP et GPIO dans l’interface AMS, sous Paramètres; les valeurs héritées de `.env` servent seulement à préremplir la configuration jusqu’à son enregistrement dans l’application.
 
-Rendez `writable/` accessible en écriture au processus PHP; le reste du code devrait être en lecture seule. La racine du virtual host doit pointer uniquement vers `backend/public`, pas vers la racine du dépôt. Désactivez l’affichage des erreurs en production et centralisez les logs avec des permissions restreintes.
+Rendez `writable/` accessible en écriture au processus PHP; le reste du code devrait être en lecture seule. Sauvegardez séparément `writable/keys/integration-settings.key`, qui protège les secrets d’intégration chiffrés en base. La racine du virtual host doit pointer uniquement vers `backend/public`, pas vers la racine du dépôt. Désactivez l’affichage des erreurs en production et centralisez les logs avec des permissions restreintes.
+
+### Suivi des traitements et relances contrôlées
+
+Après le déploiement de la migration, le panneau **Paramètres → Intégrations** (super-administrateur uniquement) affiche les dernières exécutions des rapports J-1, synchronisations GPIO et traitements des capteurs, avec leur état, leur dernier signal de vie et leurs erreurs. Les traitements continus `capteurs:scan` et `capteurs:scan-all` mettent à jour ce signal à chaque cycle; une exécution sans signal depuis 15 minutes est marquée obsolète.
+
+Pour traiter les relances mises en file par le panneau, planifiez sur le serveur un lancement fréquent du worker, par exemple chaque minute avec cron :
+
+```cron
+* * * * * cd /srv/ams && /usr/bin/php spark system:jobs:process-retries >> /var/log/ams-job-retries.log 2>&1
+```
+
+Le worker traite au maximum 20 demandes par lancement. Il n’est pas déclenché par l’interface, qui ne fait que mettre une demande en file; surveillez son code de sortie et ses journaux. Une relance J-1 reprend les paramètres de l’exécution source : dates d’exécution/rapport, tenant, configuration, format, langue, éligibilité, destinataires et unités. Les rapports déjà archivés sont ignorés. Les résultats de relance sont `SUCCESS`, `PARTIAL` ou `ERROR`; une relance partielle n’est pas présentée comme un succès complet. Une relance de rapport peut envoyer de vrais courriels aux destinataires configurés. Ne testez pas le worker en production sans examiner d’abord la file et les conséquences; aucun test d’envoi SMTP n’est effectué par cette procédure.
+
+Le panneau signale les exécutions échouées/partielles, les signaux de vie périmés, l’absence de lancement des rapports J-1 pendant plus de 26 heures lorsqu’une configuration est active, ainsi qu’une file de relance bloquée pendant plus de cinq minutes. Il n’existe pas de seuil générique GPIO car sa fréquence relève du planificateur de chaque serveur; configurez une alerte d’exploitation adaptée à sa fréquence réelle. L’historique applicatif est conservé 90 jours par défaut; planifiez une purge mensuelle :
+
+```cron
+17 3 1 * * cd /srv/ams && /usr/bin/php spark system:jobs:prune-history 90 >> /var/log/ams-job-retention.log 2>&1
+```
+
+Avant une rétention plus courte, vérifiez les exigences d’audit et de conservation de l’organisation.
+
+La CI backend exécute les tests SQLite ainsi qu’un test de concurrence de la file sur MySQL 8/InnoDB. Le test MySQL utilise une base dédiée `ams_test`; ne fournissez jamais une base d’application ou de production comme cible de test.
 
 ## Apache / Nginx et HTTPS
 
@@ -89,19 +115,36 @@ Ne lancez pas de stack avec secrets fictifs en production. Documenter les health
 
 ## Sauvegarde et restauration
 
-Sauvegardez régulièrement MySQL avec chiffrement au repos et stockage hors serveur. Exemple d’export manuel (l’invite interactive/outil de secrets est préférable à une commande contenant le mot de passe) :
+Les scripts `scripts/backup-ams.sh` et `scripts/verify-ams-backup.sh` créent une sauvegarde MySQL chiffrée et vérifient sa restauration dans une nouvelle base isolée. Si l’archive appariée existe, la vérification déchiffre aussi uploads et clé d’intégration vers un dossier de staging privé et contrôle les chemins/types avant extraction. Aucun de ces scripts ne supprime de base. Prérequis : `mysqldump`, `mysql`, `gpg`, `gzip`, `tar`, `sha256sum`, une clé publique GPG de sauvegarde et deux profils `mysql_config_editor` distincts : `ams-backup` en lecture seule sur AMS, `ams-restore` limité aux bases `ams_restore_verify_*`.
 
-```bash
-mysqldump --single-transaction --routines --triggers ams > ams-$(date +%F).sql
+Exemple de séparation des privilèges MySQL (adaptez les hôtes et secrets) :
+
+```sql
+CREATE USER 'ams_backup'@'10.%' IDENTIFIED BY '<secret-sauvegarde>';
+GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES ON ams.* TO 'ams_backup'@'10.%';
+CREATE USER 'ams_restore'@'10.%' IDENTIFIED BY '<secret-restauration>';
+GRANT ALL PRIVILEGES ON `ams_restore_verify\_%`.* TO 'ams_restore'@'10.%';
 ```
 
-Restaurer dans une instance isolée avant de remplacer les données actives :
+Le compte de restauration n’a aucun accès à la base active AMS; ses privilèges, y compris ceux nécessaires à la restauration du dump, sont limités au préfixe des bases temporaires. Le script ne supprime aucune base. Testez le motif de privilèges sur la version MySQL déployée et vérifiez avec `SHOW GRANTS` qu’il ne correspond qu’aux bases de vérification.
 
 ```bash
-mysql ams < ams-AAAA-MM-JJ.sql
+gpg --import /chemin-securise/cle-publique-sauvegarde.asc
+mysql_config_editor set --login-path=ams-backup --host=127.0.0.1 --user=ams_backup --password
+mysql_config_editor set --login-path=ams-restore --host=127.0.0.1 --user=ams_restore --password
+export AMS_BACKUP_GPG_RECIPIENT='empreinte-GPG-de-l-equipe-de-reprise'
+sudo -u ams bash ./scripts/backup-and-verify-ams.sh ams /srv/backups/ams
 ```
 
-Documentez la rétention, chiffrez les sauvegardes, testez régulièrement la restauration et vérifiez les fichiers nécessaires (logos, données uploadées, configurations externalisées). Une sauvegarde non testée n’est pas une procédure de reprise.
+Le mot de passe de chaque profil MySQL est demandé interactivement par `mysql_config_editor`, jamais passé en argument. La sauvegarde est chiffrée, accompagnée d’un SHA-256 et publiée de manière atomique; ses fichiers sont créés avec des permissions restrictives. Le script inclut `writable/uploads` ainsi que `writable/keys/integration-settings.key` lorsqu’ils existent et refuse les liens symboliques. `backup-and-verify-ams.sh` enchaîne sauvegarde et restauration/vérification dans une base et un répertoire isolés. Exécutez cette commande quotidiennement via le planificateur de l’hôte; stockez les sauvegardes sur un support indépendant et la clé privée GPG hors du serveur AMS. Surveillez le code de sortie, le nom de la base restaurée, le dossier d’assets et l’âge de la dernière sauvegarde. Ne supprimez les bases de vérification qu’après inspection et approbation explicite; appliquez la rétention dans le stockage des sauvegardes selon la politique institutionnelle.
+
+### Déploiement et retour arrière
+
+1. Sauvegardez la base et les fichiers avant une migration de production; vérifiez au minimum le checksum.
+2. Déployez une release versionnée dans un nouveau répertoire sans écraser celle qui sert le trafic. Gardez la release précédente.
+3. Exécutez les migrations prévues puis les contrôles de santé avant la bascule. Privilégiez les migrations additives compatibles avec les deux versions.
+4. En cas d’échec applicatif, rebasculez le code vers la release précédente et vérifiez les parcours critiques. Ne lancez pas automatiquement de migration descendante : elle peut être destructive ou irréversible.
+5. Si la base doit être restaurée, faites-le d’abord sur une instance isolée et obtenez une validation métier avant toute bascule. Consignez la décision, l’heure et le point de restauration.
 
 ## Checklist de mise en production
 

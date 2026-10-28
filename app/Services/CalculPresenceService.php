@@ -104,6 +104,43 @@ class CalculPresenceService
         if ($contexte === null) {
             throw new \RuntimeException('Employé introuvable.');
         }
+        $tenantId = (int) $contexte['tenant_id'];
+        $horaireChoisi = null;
+        if (isset($this->db) && $this->db->tableExists('tenant_regles_pointage_versions')) {
+            $horaireChoisi = $this->chargerHoraireInterpretation($contexte, $date);
+            $version = (new AttendanceRuleVersionService($this->db))->getApplicable(
+                $tenantId,
+                $date,
+                isset($horaireChoisi['horaire']['id']) ? (int) $horaireChoisi['horaire']['id'] : null
+            );
+            if ($version !== null && $version['actif'] && $version['creneaux'] !== []) {
+                return $this->ajouterCompatibiliteResultatHistorique(
+                    $this->calculerJourneeAvecNouvellesRegles(
+                        $contexte,
+                        $date,
+                        $version['creneaux'],
+                        $horaireChoisi,
+                        $version['parametres'],
+                        (int) $version['id']
+                    )
+                );
+            }
+        }
+        if (isset($this->db)) {
+            $horaireChoisi ??= $this->chargerHoraireInterpretation($contexte, $date);
+            $evaluation = $horaireChoisi['evaluation'] ?? null;
+            if ($evaluation === null
+                && $horaireChoisi['contrat'] === null
+                && ! $this->tenantTravailleCeJour($contexte, $date)
+            ) {
+                $evaluation = 'REPOS';
+            }
+            if ($evaluation !== null) {
+                return $this->ajouterCompatibiliteResultatHistorique(
+                    $this->resultatSansEvaluation($contexte, $date, $horaireChoisi, $evaluation)
+                );
+            }
+        }
         if ((int) $contexte['actif_regles_nouvelles'] !== 1) {
             return $this->calculerJournee($employeId, $date);
         }
@@ -113,7 +150,182 @@ class CalculPresenceService
             return $this->calculerJournee($employeId, $date);
         }
 
-        return $this->calculerJourneeAvecNouvellesRegles($contexte, $date, $creneaux);
+        return $this->ajouterCompatibiliteResultatHistorique(
+            $this->calculerJourneeAvecNouvellesRegles($contexte, $date, $creneaux)
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $contexte
+     * @param array<string, mixed> $horaireChoisi
+     * @return array<string, mixed>
+     */
+    protected function resultatSansEvaluation(array $contexte, string $date, array $horaireChoisi, string $evaluation): array
+    {
+        return [
+            'tenant_id' => (int) $contexte['tenant_id'],
+            'employe_id' => (int) $contexte['employe_id'],
+            'source_calcul' => $horaireChoisi['source'],
+            'heure_arrivee' => null,
+            'statut_arrivee' => null,
+            'heure_debut_pause' => null,
+            'statut_debut_pause' => null,
+            'heure_fin_pause' => null,
+            'statut_fin_pause' => null,
+            'heure_depart' => null,
+            'statut_depart' => null,
+            'heures_travaillees' => 0.0,
+            'heures_supplementaires' => 0.0,
+            'statut_global' => 'PRESENT',
+            'details' => [
+                'source' => $horaireChoisi['source'],
+                'date' => $date,
+                'horaire_id' => isset($horaireChoisi['horaire']['id']) ? (int) $horaireChoisi['horaire']['id'] : null,
+                'horaire_nom' => $horaireChoisi['horaire']['nom'] ?? null,
+                'mode_travail' => $horaireChoisi['contrat']['mode_travail'] ?? null,
+                'evaluation' => $evaluation,
+                'creneaux' => [],
+            ],
+        ];
+    }
+
+    /**
+     * Compares the persisted calculation with a proposed rule configuration without writing projections.
+     *
+     * @param array<string, mixed> $parametres
+     * @param array<int, array<string, mixed>> $creneaux
+     * @return array<string, mixed>
+     */
+    public function comparerJourneeAvecRegles(
+        int $employeId,
+        string $date,
+        ?int $horaireId,
+        bool $actif,
+        array $parametres,
+        array $creneaux
+    ): array {
+        $this->normaliserDate($date);
+        if ($employeId < 1) {
+            throw new \InvalidArgumentException('Identifiant employé invalide.');
+        }
+        $contexte = $this->chargerContexteInterpretation($employeId);
+        if ($contexte === null) {
+            throw new \RuntimeException('Employé introuvable.');
+        }
+
+        $horaireChoisi = $this->chargerHoraireInterpretation($contexte, $date);
+        $horaireEmployeId = isset($horaireChoisi['horaire']['id'])
+            ? (int) $horaireChoisi['horaire']['id']
+            : null;
+        if ($horaireId !== null && $horaireId !== $horaireEmployeId) {
+            throw new \InvalidArgumentException('L’employé sélectionné n’utilise pas l’horaire choisi pour le profil.');
+        }
+        $configuration = (new AttendanceRuleVersionService($this->db))->preparer(
+            (int) $contexte['tenant_id'],
+            $horaireId,
+            $actif,
+            $parametres,
+            $creneaux
+        );
+
+        $avant = $this->interpreterJournee($employeId, $date);
+        $apres = $actif
+            ? $this->ajouterCompatibiliteResultatHistorique(
+                $this->calculerJourneeAvecNouvellesRegles(
+                    $contexte,
+                    $date,
+                    $configuration['creneaux'],
+                    $horaireChoisi,
+                    $configuration['parametres']
+                )
+            )
+            : $this->calculerJournee($employeId, $date);
+
+        return [
+            'date' => $date,
+            'employe_id' => $employeId,
+            'avant' => $this->resumerResultatComparaison($avant),
+            'apres' => $this->resumerResultatComparaison($apres),
+            'different' => $this->resumerResultatComparaison($avant) !== $this->resumerResultatComparaison($apres),
+            'pointages_pause_observes' => $configuration['pointages_pause_observes'],
+            'creneaux_pause_configures' => in_array('DEBUT_PAUSE', array_column($configuration['creneaux'], 'type_creneau'), true)
+                && in_array('FIN_PAUSE', array_column($configuration['creneaux'], 'type_creneau'), true),
+        ];
+    }
+
+    /** @param array<string, mixed> $resultat
+     *  @return array<string, mixed>
+     */
+    private function resumerResultatComparaison(array $resultat): array
+    {
+        return [
+            'statut' => $resultat['statut'] ?? $resultat['statut_global'] ?? 'ANORMAL',
+            'statut_global' => $resultat['statut_global'] ?? null,
+            'heure_arrivee' => $resultat['heure_arrivee'] ?? null,
+            'heure_depart' => $resultat['heure_depart'] ?? null,
+            'heures_travaillees' => (float) ($resultat['heures_travaillees'] ?? 0),
+            'horaire_nom' => $resultat['horaire_nom'] ?? $resultat['details']['horaire_nom'] ?? null,
+            'evaluation' => $resultat['details']['evaluation'] ?? null,
+            'creneaux' => $resultat['details']['creneaux'] ?? [],
+        ];
+    }
+
+    /** @param array<string, mixed> $resultat
+     *  @return array<string, mixed>
+     */
+    protected function ajouterCompatibiliteResultatHistorique(array $resultat): array
+    {
+        $statuts = [
+            'PRESENT' => 'NORMAL',
+            'RETARD' => 'RETARD',
+            'ABSENT' => 'ABSENT',
+            'EN_COURS' => 'EN_COURS',
+            'INCOMPLET' => 'ANORMAL',
+            'HORS_CRENEAU' => 'ANORMAL',
+            'ANTICIPE' => 'ANORMAL',
+            'ANORMAL' => 'ANORMAL',
+            'FERIE' => 'FERIE',
+        ];
+        $resultat['statut'] = ($resultat['details']['evaluation'] ?? null) === 'AUCUN_JUGEMENT'
+            || ($resultat['details']['evaluation'] ?? null) === 'SANS_JUGEMENT'
+                ? 'SANS_JUGEMENT'
+                : (($resultat['details']['evaluation'] ?? null) === 'REPOS'
+                    ? 'REPOS'
+                    : ($statuts[$resultat['statut_global']] ?? 'ANORMAL'));
+        $resultat['retard_total_minutes'] = 0;
+        $resultat['pointages_manquants'] = [];
+        $resultat['analyse_plages'] = [];
+
+        foreach ($resultat['details']['creneaux'] ?? [] as $creneau) {
+            $type = match ($creneau['creneau'] ?? '') {
+                'ARRIVEE' => 'CHECK_IN',
+                'DEBUT_PAUSE' => 'BREAK_OUT',
+                'FIN_PAUSE' => 'BREAK_IN',
+                'DEPART' => 'CHECK_OUT',
+                default => (string) ($creneau['creneau'] ?? 'UNKNOWN'),
+            };
+            $statut = match ($creneau['statut'] ?? '') {
+                'INCOMPLET', 'ABSENT' => 'MANQUANT',
+                'HORS_CRENEAU', 'ANTICIPE', 'ANORMAL' => 'ANORMAL',
+                default => (string) ($creneau['statut'] ?? 'UNKNOWN'),
+            };
+            $reel = $creneau['reel'] ?? null;
+            $resultat['analyse_plages'][] = [
+                'type' => $type,
+                'attendu' => $creneau['attendu'] ?? '',
+                'reel' => is_string($reel) ? substr($reel, 11, 5) : null,
+                'ecart_min' => $creneau['ecart_minutes'] ?? null,
+                'statut' => $statut,
+            ];
+            if ($statut === 'RETARD') {
+                $resultat['retard_total_minutes'] += max(0, (int) ($creneau['ecart_minutes'] ?? 0));
+            }
+            if ($statut === 'MANQUANT') {
+                $resultat['pointages_manquants'][] = sprintf('%s à %s', $type, $creneau['attendu'] ?? '');
+            }
+        }
+
+        return $resultat;
     }
 
     /**
@@ -127,7 +339,7 @@ class CalculPresenceService
         if (! isset($resultat['statut_global'], $resultat['tenant_id'], $resultat['source_calcul'])) {
             return 0;
         }
-        if (($resultat['details']['evaluation'] ?? null) === 'AUCUN_JUGEMENT') {
+        if (in_array($resultat['details']['evaluation'] ?? null, ['AUCUN_JUGEMENT', 'SANS_JUGEMENT', 'REPOS'], true)) {
             return 0;
         }
 
@@ -270,10 +482,15 @@ class CalculPresenceService
                 'horaire' => $this->horaireDepuisShift($shift, $date),
                 'contrat' => null,
                 'sans_jugement' => false,
+                'evaluation' => null,
             ];
         }
 
-        $contrat = $this->chargerContratActif($tenantId, $employeId, $date);
+        $contratActif = $this->chargerContratActif($tenantId, $employeId, $date);
+        $contratHorsPeriode = $contratActif === null && isset($this->db)
+            ? $this->chargerContratReference($tenantId, $employeId)
+            : null;
+        $contrat = $contratActif ?? $contratHorsPeriode;
 
         $source = $contrat === null ? 'TENANT_DEFAUT' : 'CONTRAT';
         $horaire = [];
@@ -290,6 +507,16 @@ class CalculPresenceService
         }
         $horaire = $this->normaliserHoraire($horaire);
 
+        if ($contratHorsPeriode !== null) {
+            return [
+                'source' => 'CONTRAT',
+                'horaire' => $horaire,
+                'contrat' => $contratHorsPeriode,
+                'sans_jugement' => false,
+                'evaluation' => 'REPOS',
+            ];
+        }
+
         if ($contrat !== null) {
             $mode = (string) $contrat['mode_travail'];
             if ($mode === 'HORAIRE_LIBRE' || ! $this->contratActifCeJour($contrat, $date)) {
@@ -298,6 +525,7 @@ class CalculPresenceService
                     'horaire' => $horaire,
                     'contrat' => $contrat,
                     'sans_jugement' => true,
+                    'evaluation' => $mode === 'HORAIRE_LIBRE' ? 'SANS_JUGEMENT' : 'REPOS',
                 ];
             }
 
@@ -309,6 +537,7 @@ class CalculPresenceService
             'horaire' => $horaire,
             'contrat' => $contrat,
             'sans_jugement' => false,
+            'evaluation' => null,
         ];
     }
 
@@ -325,6 +554,19 @@ class CalculPresenceService
                 ->where('date_fin', null)
                 ->orWhere('date_fin >=', $date)
             ->groupEnd()
+            ->orderBy('date_debut', 'DESC')
+            ->get()
+            ->getRowArray();
+    }
+
+    /** @return ?array<string, mixed> */
+    protected function chargerContratReference(int $tenantId, int $employeId): ?array
+    {
+        return $this->db->table('employe_contrats_horaire')
+            ->where('tenant_id', $tenantId)
+            ->where('employe_id', $employeId)
+            ->where('actif', 1)
+            ->where('deleted_at', null)
             ->orderBy('date_debut', 'DESC')
             ->get()
             ->getRowArray();
@@ -368,11 +610,23 @@ class CalculPresenceService
      * @param array<int, array<string, mixed>> $creneaux
      * @return array<string, mixed>
      */
-    protected function calculerJourneeAvecNouvellesRegles(array $contexte, string $date, array $creneaux): array
+    protected function calculerJourneeAvecNouvellesRegles(
+        array $contexte,
+        string $date,
+        array $creneaux,
+        ?array $horaireChoisi = null,
+        ?array $parametresVersion = null,
+        ?int $versionId = null
+    ): array
     {
         $tenantId = (int) $contexte['tenant_id'];
         $employeId = (int) $contexte['employe_id'];
-        $horaireChoisi = $this->chargerHoraireInterpretation($contexte, $date);
+        $jourFerie = $this->trouverJourFerie($employeId, $date);
+        if ($jourFerie !== null && (int) $jourFerie['travaille'] === 0) {
+            return $this->resultatJourFerieInterprete($contexte, $date, $jourFerie);
+        }
+
+        $horaireChoisi ??= $this->chargerHoraireInterpretation($contexte, $date);
         $base = [
             'tenant_id' => $tenantId,
             'employe_id' => $employeId,
@@ -387,12 +641,21 @@ class CalculPresenceService
             'statut_depart' => null,
             'heures_travaillees' => 0.0,
             'heures_supplementaires' => 0.0,
-            'details' => ['source' => $horaireChoisi['source'], 'date' => $date],
+            'details' => [
+                'source' => $horaireChoisi['source'],
+                'date' => $date,
+                'horaire_id' => isset($horaireChoisi['horaire']['id']) ? (int) $horaireChoisi['horaire']['id'] : null,
+                'horaire_nom' => $horaireChoisi['horaire']['nom'] ?? null,
+                'mode_travail' => $horaireChoisi['contrat']['mode_travail'] ?? null,
+                'regle_version_id' => $versionId,
+            ],
         ];
-        if ($horaireChoisi['sans_jugement']
-            || ($horaireChoisi['contrat'] === null && ! $this->tenantTravailleCeJour($contexte, $date))
-        ) {
-            return [...$base, 'statut_global' => 'PRESENT', 'details' => [...$base['details'], 'evaluation' => 'AUCUN_JUGEMENT']];
+        $jourTenantNonTravaille = $horaireChoisi['contrat'] === null
+            && ! $this->tenantTravailleCeJour($contexte, $date);
+        if ($horaireChoisi['sans_jugement'] || $jourTenantNonTravaille) {
+            $evaluation = $horaireChoisi['evaluation'] ?? ($jourTenantNonTravaille ? 'REPOS' : 'AUCUN_JUGEMENT');
+
+            return [...$base, 'statut_global' => 'PRESENT', 'details' => [...$base['details'], 'evaluation' => $evaluation]];
         }
 
         $horaire = $horaireChoisi['horaire'];
@@ -401,12 +664,12 @@ class CalculPresenceService
             $plagesParType[$this->normaliserType((string) ($plage['type'] ?? ''))] = $plage;
         }
         $mapping = [
-            'ARRIVEE' => ['evenement' => 'CHECK_IN', 'heure' => 'heure_arrivee', 'statut' => 'statut_arrivee', 'reference' => 'debut'],
+            'ARRIVEE' => ['evenement' => 'CHECK_IN', 'heure' => 'heure_arrivee', 'statut' => 'statut_arrivee', 'reference' => 'fin'],
             'DEBUT_PAUSE' => ['evenement' => 'BREAK_OUT', 'heure' => 'heure_debut_pause', 'statut' => 'statut_debut_pause', 'reference' => 'debut'],
-            'FIN_PAUSE' => ['evenement' => 'BREAK_IN', 'heure' => 'heure_fin_pause', 'statut' => 'statut_fin_pause', 'reference' => 'fin'],
+            'FIN_PAUSE' => ['evenement' => 'BREAK_IN', 'heure' => 'heure_fin_pause', 'statut' => 'statut_fin_pause', 'reference' => 'debut'],
             'DEPART' => ['evenement' => 'CHECK_OUT', 'heure' => 'heure_depart', 'statut' => 'statut_depart', 'reference' => 'fin'],
         ];
-        $parametres = $this->chargerParametresInterpretation($tenantId);
+        $parametres = $parametresVersion ?? $this->chargerParametresInterpretation($tenantId);
         $ecartMax = (int) $parametres['ecart_max_association_minutes'];
         $minutesPauseMin = (int) $parametres['duree_pause_minimum_minutes'];
         $minutesPauseMax = (int) $parametres['duree_pause_maximum_minutes'];
@@ -418,6 +681,9 @@ class CalculPresenceService
                 throw new \UnexpectedValueException('Type de créneau de pointage inconnu.');
             }
             $plage = $plagesParType[$specification['evenement']] ?? [];
+            if (! empty($horaire['est_shift']) && $plage === []) {
+                continue;
+            }
             $debut = $this->normaliserHeureOptionnelle($creneau['plage_debut'] ?? null)
                 ?? $this->normaliserHeureOptionnelle($plage['debut'] ?? null);
             $fin = $this->normaliserHeureOptionnelle($creneau['plage_fin'] ?? null)
@@ -453,11 +719,91 @@ class CalculPresenceService
                 'fin' => $fin,
                 'tolerance' => max(0, (int) ($creneau['tolerance_minutes'] ?? 0)),
                 'jour_offset' => (int) ($plage['jour_offset'] ?? 0),
+                'autoriser_avance' => $typeCreneau === 'ARRIVEE',
+                'autoriser_retard' => $typeCreneau === 'DEPART',
+                'heure_limite_lendemain' => $this->normaliserHeureOptionnelle(
+                    $plagesParType['CHECK_IN']['debut'] ?? $plagesParType['CHECK_IN']['fin'] ?? null
+                ),
             ];
         }
 
-        $inclureLendemain = ! empty($horaire['est_shift']) && $this->shiftTraverseMinuit($horaire);
-        $pointages = $this->chargerPointagesInterpretation($tenantId, $employeId, $date, $inclureLendemain);
+        $heureLimiteLendemain = null;
+        foreach ($stages as $stage) {
+            if ($stage['type'] === 'ARRIVEE') {
+                $heureLimiteLendemain = $stage['cible'] ?? $stage['fin'] ?? null;
+                break;
+            }
+        }
+        $shiftTraverseMinuit = ! empty($horaire['est_shift']) && $this->shiftTraverseMinuit($horaire);
+        if (! empty($horaire['est_shift'])) {
+            $heureLimiteLendemain = $shiftTraverseMinuit
+                ? substr((string) $horaire['heure_debut'], 0, 5)
+                : '00:00';
+        }
+        $heureLimiteLendemain ??= '07:30';
+        foreach ($stages as &$stage) {
+            if ($stage['type'] === 'DEPART') {
+                $stage['heure_limite_lendemain'] = $heureLimiteLendemain;
+                $stage['autoriser_lendemain'] = empty($horaire['est_shift']) || $shiftTraverseMinuit;
+            }
+        }
+        unset($stage);
+        $pointages = $this->chargerPointagesInterpretation(
+            $tenantId,
+            $employeId,
+            $date,
+            $heureLimiteLendemain
+        );
+        $pointages = $this->filtrerPointagesPourHoraire(
+            $pointages,
+            $date,
+            $horaire,
+            $ecartMax,
+            $heureLimiteLendemain
+        );
+        if ($jourFerie !== null && $pointages === []) {
+            return $this->resultatJourFerieInterprete($contexte, $date, $jourFerie);
+        }
+
+        $maintenantTenant = $this->maintenantTenant($tenantId);
+        $stageArrivee = null;
+        foreach ($stages as $stage) {
+            if ($stage['type'] === 'ARRIVEE') {
+                $stageArrivee = $stage;
+                break;
+            }
+        }
+        $aUnEvenementArrivee = false;
+        foreach ($pointages as $pointage) {
+            if ($this->normaliserType((string) ($pointage['type_evenement'] ?? '')) === 'CHECK_IN') {
+                $aUnEvenementArrivee = true;
+                break;
+            }
+        }
+        $arriveeManquante = $stageArrivee !== null
+            && ! $aUnEvenementArrivee
+            && $this->pointageLePlusProche($stageArrivee, $pointages, [], $date, $ecartMax) === null;
+        if ($arriveeManquante && $date === $maintenantTenant->format('Y-m-d')) {
+            $stage = $stageArrivee;
+                $echeance = $this->echeanceArrivee($stage, $date, $maintenantTenant->getTimezone());
+                if ($maintenantTenant <= $echeance) {
+                    $base['statut_global'] = 'EN_COURS';
+                    $base['details'] = [
+                        ...$base['details'],
+                        'evaluation' => 'AUCUNE_ARRIVEE_AVANT_ECHEANCE',
+                        'heure_attendue' => $stage['cible'] ?? $stage['fin'],
+                        'echeance_arrivee' => $echeance->format('Y-m-d H:i:s'),
+                        'creneaux' => array_map(static fn (array $item): array => [
+                            'creneau' => $item['type'],
+                            'attendu' => $item['cible'] ?? null,
+                            'statut' => $item['type'] === 'ARRIVEE' ? 'EN_COURS' : 'A_VENIR',
+                        ], $stages),
+                    ];
+
+                    return $base;
+                }
+        }
+
         $utilises = [];
         $statuts = [];
         $traces = [];
@@ -467,12 +813,20 @@ class CalculPresenceService
         foreach ($stages as $stage) {
             $candidat = $this->pointageLePlusProche($stage, $pointages, $utilises, $date, $ecartMax);
             if ($candidat === null) {
-                $stageStatus = $pointages === [] && $stage['type'] === 'ARRIVEE'
+                $stageStatus = $stage['type'] === 'ARRIVEE' && $arriveeManquante
                     ? 'ABSENT'
-                    : 'INCOMPLET';
+                    : ($pointages === [] && $stage['type'] === 'ARRIVEE' ? 'ABSENT' : 'INCOMPLET');
                 $base[$stage['statut']] = $stageStatus;
                 $statuts[] = $stageStatus;
-                $traces[] = ['creneau' => $stage['type'], 'statut' => $stageStatus];
+                $traces[] = [
+                    'creneau' => $stage['type'],
+                    'mode' => $stage['mode'],
+                    'attendu' => $stage['cible'],
+                    'plage' => [$stage['debut'], $stage['fin']],
+                    'reel' => null,
+                    'ecart_minutes' => null,
+                    'statut' => $stageStatus,
+                ];
                 continue;
             }
             $utilises[$candidat['index']] = true;
@@ -505,9 +859,20 @@ class CalculPresenceService
         foreach ($utilises as $index => $_) {
             $pointagesUtilises[] = $pointages[$index];
         }
+        if (! empty($horaire['est_shift'])) {
+            $pointagesUtilises = $this->ajouterPauseShiftPourCalculHeures(
+                $pointagesUtilises,
+                $pointages
+            );
+        }
         $pointagesHorsCreneau = [];
         foreach ($pointages as $index => $pointage) {
             if (! isset($utilises[$index])) {
+                if (! empty($horaire['est_shift'])
+                    && in_array($this->normaliserType((string) $pointage['type_evenement']), ['BREAK_OUT', 'BREAK_IN'], true)
+                ) {
+                    continue;
+                }
                 $pointagesHorsCreneau[] = $pointage;
             }
         }
@@ -526,7 +891,9 @@ class CalculPresenceService
             }
         }
 
-        $base['heures_travaillees'] = $this->calculerHeuresTravaillees($pointagesUtilises);
+        $base['heures_travaillees'] = ! empty($horaire['est_shift'])
+            ? $this->calculerHeuresShiftAvecPauses($pointagesUtilises)
+            : $this->calculerHeuresAvecHorodatages($pointagesUtilises);
         $heuresNormales = $this->heuresNormalesHoraire($horaire);
         if ($horaireChoisi['contrat'] !== null
             && in_array($horaireChoisi['contrat']['mode_travail'], ['MI_TEMPS_MATIN', 'MI_TEMPS_APRES_MIDI'], true)
@@ -554,7 +921,10 @@ class CalculPresenceService
         $base['details'] = [
             'source' => $horaireChoisi['source'],
             'date' => $date,
+            'horaire_id' => isset($horaire['id']) ? (int) $horaire['id'] : null,
+            'horaire_nom' => $horaire['nom'] ?? null,
             'mode_travail' => $horaireChoisi['contrat']['mode_travail'] ?? null,
+            'regle_version_id' => $versionId,
             'creneaux' => $traces,
             'pointages_non_associes' => array_values(array_map(
                 static fn (array $pointage): array => [
@@ -572,7 +942,50 @@ class CalculPresenceService
             ],
         ];
 
+        if ($jourFerie !== null) {
+            $base['jour_ferie'] = true;
+            $base['jour_ferie_nom'] = $jourFerie['nom'];
+            $base['ferie_travail'] = true;
+            $base['prime_potentielle'] = $base['heures_travaillees'] > 0;
+            $base['details']['jour_ferie_nom'] = $jourFerie['nom'];
+            $base['details']['evaluation'] = 'JOUR_FERIE_TRAVAILLE';
+        }
+
         return $base;
+    }
+
+    /** @param array<string, mixed> $contexte
+     *  @param array<string, mixed> $jourFerie
+     *  @return array<string, mixed>
+     */
+    protected function resultatJourFerieInterprete(array $contexte, string $date, array $jourFerie): array
+    {
+        return [
+            'tenant_id' => (int) $contexte['tenant_id'],
+            'employe_id' => (int) $contexte['employe_id'],
+            'source_calcul' => 'JOUR_FERIE',
+            'heure_arrivee' => null,
+            'statut_arrivee' => null,
+            'heure_debut_pause' => null,
+            'statut_debut_pause' => null,
+            'heure_fin_pause' => null,
+            'statut_fin_pause' => null,
+            'heure_depart' => null,
+            'statut_depart' => null,
+            'heures_travaillees' => 0.0,
+            'heures_supplementaires' => 0.0,
+            'statut_global' => 'FERIE',
+            'jour_ferie' => true,
+            'jour_ferie_nom' => $jourFerie['nom'],
+            'ferie_travail' => (int) $jourFerie['travaille'] === 1,
+            'prime_potentielle' => false,
+            'details' => [
+                'source' => 'JOUR_FERIE',
+                'date' => $date,
+                'evaluation' => 'JOUR_FERIE',
+                'jour_ferie_nom' => $jourFerie['nom'],
+            ],
+        ];
     }
 
     /** @return array<int, array<string, mixed>> */
@@ -580,20 +993,196 @@ class CalculPresenceService
         int $tenantId,
         int $employeId,
         string $date,
-        bool $inclureLendemain
+        string $heureLimiteLendemain
     ): array {
         return $this->db->table('pointages')
             ->where('tenant_id', $tenantId)
             ->where('employe_id', $employeId)
             ->where('date_pointage >=', $date . ' 00:00:00')
-            ->where('date_pointage <=', $inclureLendemain
-                ? (new DateTimeImmutable($date))->modify('+1 day')->format('Y-m-d') . ' 23:59:59'
-                : $date . ' 23:59:59')
+            ->where(
+                'date_pointage <',
+                (new DateTimeImmutable($date))->modify('+1 day')->format('Y-m-d') . ' ' . $heureLimiteLendemain . ':00'
+            )
             ->where('statut', 'VALIDE')
             ->where('deleted_at', null)
             ->orderBy('date_pointage', 'ASC')
             ->get()
             ->getResultArray();
+    }
+
+    /**
+     * Exclut la sortie du service précédent et les événements qui ne peuvent
+     * appartenir à la journée courante ou à sa sortie tardive.
+     *
+     * @param array<int, array<string, mixed>> $pointages
+     * @param array<string, mixed> $horaire
+     * @return array<int, array<string, mixed>>
+     */
+    protected function filtrerPointagesPourHoraire(
+        array $pointages,
+        string $date,
+        array $horaire,
+        int $ecartMax,
+        string $heureDebutJournee
+    ): array {
+        $estShift = ! empty($horaire['est_shift']);
+        $dateSuivante = (new DateTimeImmutable($date))->modify('+1 day')->format('Y-m-d');
+        $debutShift = $estShift
+            ? new DateTimeImmutable($date . ' ' . substr((string) $horaire['heure_debut'], 0, 8))
+                ->modify('-' . max(0, $ecartMax) . ' minutes')
+            : null;
+
+        return array_values(array_filter($pointages, function (array $pointage) use (
+            $date,
+            $dateSuivante,
+            $estShift,
+            $debutShift,
+            $heureDebutJournee
+        ): bool {
+            $type = $this->normaliserType((string) ($pointage['type_evenement'] ?? ''));
+            $horodatage = new DateTimeImmutable((string) $pointage['date_pointage']);
+            $jour = $horodatage->format('Y-m-d');
+            if ($jour === $dateSuivante) {
+                return $type === 'CHECK_OUT'
+                    || ($estShift && in_array($type, ['BREAK_OUT', 'BREAK_IN'], true));
+            }
+            if ($jour !== $date) {
+                return false;
+            }
+            if ($estShift) {
+                return $debutShift !== null && $horodatage >= $debutShift;
+            }
+
+            return ! in_array($type, ['CHECK_OUT', 'BREAK_OUT', 'BREAK_IN'], true)
+                || $horodatage->format('H:i:s') >= $heureDebutJournee . ':00';
+        }));
+    }
+
+    /**
+     * Les horaires de shift ne définissent pas encore de créneaux de pause.
+     * Les pointages réels appariés restent toutefois déduits des heures travaillées.
+     *
+     * @param array<int, array<string, mixed>> $pointagesSelectionnes
+     * @param array<int, array<string, mixed>> $pointages
+     * @return array<int, array<string, mixed>>
+     */
+    protected function ajouterPauseShiftPourCalculHeures(
+        array $pointagesSelectionnes,
+        array $pointages
+    ): array {
+        $arrivee = null;
+        $depart = null;
+        foreach ($pointagesSelectionnes as $pointage) {
+            $type = $this->normaliserType((string) ($pointage['type_evenement'] ?? ''));
+            if ($type === 'CHECK_IN') {
+                $arrivee = new DateTimeImmutable((string) $pointage['date_pointage']);
+            } elseif ($type === 'CHECK_OUT') {
+                $depart = new DateTimeImmutable((string) $pointage['date_pointage']);
+            }
+        }
+        if ($arrivee === null || $depart === null) {
+            return $pointagesSelectionnes;
+        }
+
+        $debutPause = null;
+        $finPause = null;
+        foreach ($pointages as $pointage) {
+            $type = $this->normaliserType((string) ($pointage['type_evenement'] ?? ''));
+            $instant = new DateTimeImmutable((string) $pointage['date_pointage']);
+            if ($instant <= $arrivee || $instant >= $depart) {
+                continue;
+            }
+            if ($type === 'BREAK_OUT' && $debutPause === null) {
+                $debutPause = $pointage;
+            } elseif ($type === 'BREAK_IN' && $debutPause !== null && $finPause === null
+                && $instant > new DateTimeImmutable((string) $debutPause['date_pointage'])
+            ) {
+                $finPause = $pointage;
+            }
+        }
+        if ($debutPause !== null && $finPause !== null) {
+            $pointagesSelectionnes[] = $debutPause;
+            $pointagesSelectionnes[] = $finPause;
+        }
+
+        return $pointagesSelectionnes;
+    }
+
+    /**
+     * Calcule une durée de shift avec horodatages complets pour gérer minuit.
+     *
+     * @param array<int, array<string, mixed>> $pointages
+     */
+    protected function calculerHeuresShiftAvecPauses(array $pointages): float
+    {
+        $arrivee = null;
+        $depart = null;
+        $debutPause = null;
+        $finPause = null;
+        foreach ($pointages as $pointage) {
+            $type = $this->normaliserType((string) ($pointage['type_evenement'] ?? ''));
+            $instant = new DateTimeImmutable((string) $pointage['date_pointage']);
+            if ($type === 'CHECK_IN' && ($arrivee === null || $instant < $arrivee)) {
+                $arrivee = $instant;
+            } elseif ($type === 'CHECK_OUT' && ($depart === null || $instant > $depart)) {
+                $depart = $instant;
+            } elseif ($type === 'BREAK_OUT' && ($debutPause === null || $instant < $debutPause)) {
+                $debutPause = $instant;
+            } elseif ($type === 'BREAK_IN' && ($finPause === null || $instant > $finPause)) {
+                $finPause = $instant;
+            }
+        }
+        if ($arrivee === null || $depart === null || $depart <= $arrivee) {
+            return 0.0;
+        }
+
+        $minutes = (int) floor(($depart->getTimestamp() - $arrivee->getTimestamp()) / 60);
+        if ($debutPause !== null && $finPause !== null
+            && $debutPause >= $arrivee && $finPause <= $depart && $finPause > $debutPause
+        ) {
+            $minutes -= (int) floor(($finPause->getTimestamp() - $debutPause->getTimestamp()) / 60);
+        }
+
+        return round(max(0, $minutes) / 60, 2);
+    }
+
+    /**
+     * Calcule les pointages réellement associés avec leurs dates complètes,
+     * notamment lorsque la sortie de journée est le lendemain.
+     *
+     * @param array<int, array<string, mixed>> $pointages
+     */
+    protected function calculerHeuresAvecHorodatages(array $pointages): float
+    {
+        $arrivee = null;
+        $depart = null;
+        $debutPause = null;
+        $finPause = null;
+        foreach ($pointages as $pointage) {
+            $type = $this->normaliserType((string) ($pointage['type_evenement'] ?? ''));
+            $instant = new DateTimeImmutable((string) $pointage['date_pointage']);
+            if ($type === 'CHECK_IN' && ($arrivee === null || $instant < $arrivee)) {
+                $arrivee = $instant;
+            } elseif ($type === 'CHECK_OUT' && ($depart === null || $instant > $depart)) {
+                $depart = $instant;
+            } elseif ($type === 'BREAK_OUT' && ($debutPause === null || $instant < $debutPause)) {
+                $debutPause = $instant;
+            } elseif ($type === 'BREAK_IN' && ($finPause === null || $instant > $finPause)) {
+                $finPause = $instant;
+            }
+        }
+        if ($arrivee === null || $depart === null || $depart <= $arrivee) {
+            return $this->calculerHeuresTravaillees($pointages);
+        }
+
+        $minutes = (int) floor(($depart->getTimestamp() - $arrivee->getTimestamp()) / 60);
+        if ($debutPause !== null && $finPause !== null
+            && $debutPause >= $arrivee && $finPause <= $depart && $finPause > $debutPause
+        ) {
+            $minutes -= (int) floor(($finPause->getTimestamp() - $debutPause->getTimestamp()) / 60);
+        }
+
+        return round(max(0, $minutes) / 60, 2);
     }
 
     /** @return array<string, mixed> */
@@ -686,6 +1275,31 @@ class CalculPresenceService
         );
     }
 
+    protected function maintenantTenant(int $tenantId): DateTimeImmutable
+    {
+        $timezone = isset($this->db)
+            ? (new TenantTimezoneService($this->db))->forTenant($tenantId)
+            : new DateTimeZone('Africa/Bujumbura');
+
+        return new DateTimeImmutable('now', $timezone);
+    }
+
+    /** @param array<string, mixed> $stage */
+    protected function echeanceArrivee(array $stage, string $date, DateTimeZone $timezone): DateTimeImmutable
+    {
+        $heure = $stage['mode'] === 'PLAGE'
+            ? (string) $stage['fin']
+            : (string) ($stage['cible'] ?? $stage['debut']);
+        $dateAttendue = (new DateTimeImmutable($date, $timezone))
+            ->modify(sprintf('%+d day', (int) ($stage['jour_offset'] ?? 0)))
+            ->format('Y-m-d');
+        $echeance = new DateTimeImmutable($dateAttendue . ' ' . $heure . ':00', $timezone);
+
+        return $stage['mode'] === 'PLAGE'
+            ? $echeance
+            : $echeance->modify('+' . (int) $stage['tolerance'] . ' minutes');
+    }
+
     /**
      * @param array<string, mixed> $stage
      * @param array<int, array<string, mixed>> $pointages
@@ -719,7 +1333,29 @@ class CalculPresenceService
                 ->modify(sprintf('%+d day', (int) ($stage['jour_offset'] ?? 0)))
                 ->format('Y-m-d');
             $heureCible = new DateTimeImmutable($referenceDate . ' ' . $reference . ':00');
-            $ecart = (int) floor(abs($heurePointage->getTimestamp() - $heureCible->getTimestamp()) / 60);
+            $jourSuivant = (new DateTimeImmutable($date))->modify('+1 day')->format('Y-m-d');
+            if ($heurePointage->format('Y-m-d') === $jourSuivant) {
+                $limiteLendemain = $stage['heure_limite_lendemain'] ?? null;
+                if (empty($stage['autoriser_lendemain'])
+                    || $limiteLendemain === null
+                    || $heurePointage->format('H:i:s') >= $limiteLendemain . ':00'
+                ) {
+                    continue;
+                }
+                $ecart = 0;
+            } elseif ($stage['evenement'] === 'CHECK_IN'
+                && ! empty($stage['autoriser_avance'])
+                && $heurePointage <= $heureCible
+            ) {
+                $ecart = 0;
+            } elseif ($stage['evenement'] === 'CHECK_OUT'
+                && ! empty($stage['autoriser_retard'])
+                && $heurePointage >= $heureCible
+            ) {
+                $ecart = 0;
+            } else {
+                $ecart = (int) floor(abs($heurePointage->getTimestamp() - $heureCible->getTimestamp()) / 60);
+            }
             if ($ecart <= $ecartMax && $ecart < $meilleurEcart) {
                 $meilleur = ['index' => $index, 'pointage' => $pointage];
                 $meilleurEcart = $ecart;
@@ -851,8 +1487,8 @@ class CalculPresenceService
      * @return array{
      *   periode:array{debut:string,fin:string},
      *   granularite:string,
-     *   donnees:array<int,array{date:string,presents:int,retards:int,absents:int,feries:int,repos:int,total:int}>,
-     *   totaux:array{presents:int,retards:int,absents:int,feries:int,repos:int,total:int}
+    *   donnees:array<int,array{date:string,presents:int,retards:int,absents:int,en_cours:int,feries:int,repos:int,total:int}>,
+    *   totaux:array{presents:int,retards:int,absents:int,en_cours:int,feries:int,repos:int,total:int}
      * }
      */
     public function getStatsPresenceParJour(
@@ -985,7 +1621,7 @@ class CalculPresenceService
             $joursFeriesParDate[$dateTexte] = $this->jourFeriePourDate($joursFeries, $dateTexte);
         }
         $tenant = $this->db->table('tenants')
-            ->select('jours_travailles')
+            ->select('jours_travailles, actif_regles_nouvelles')
             ->where('id', $tenantId)
             ->where('deleted_at', null)
             ->get()
@@ -994,12 +1630,38 @@ class CalculPresenceService
             throw new \RuntimeException('Tenant introuvable.');
         }
         $joursTravailles = JourTravailleService::normaliserJours($tenant['jours_travailles'] ?? null);
+        $utiliserNouvellesRegles = (int) ($tenant['actif_regles_nouvelles'] ?? 0) === 1;
+        if ($this->db->tableExists('tenant_regles_pointage_versions')) {
+            $utiliserNouvellesRegles = $utiliserNouvellesRegles
+                || $this->db->table('tenant_regles_pointage_versions')
+                    ->where('tenant_id', $tenantId)
+                    ->where('actif', 1)
+                    ->where('date_effet <=', $dateFin)
+                    ->countAllResults() > 0;
+        }
+        if ($this->db->tableExists('employe_contrats_horaire')) {
+            $utiliserNouvellesRegles = $utiliserNouvellesRegles
+                || $this->db->table('employe_contrats_horaire')
+                    ->where('tenant_id', $tenantId)
+                    ->where('actif', 1)
+                    ->where('deleted_at', null)
+                    ->countAllResults() > 0;
+        }
+        $serviceInterpretation = $utiliserNouvellesRegles ? new self(null, $this->db) : null;
 
         $parJour = [];
         $date = $debut;
         while ($date <= $fin) {
             $jour = $date->format('Y-m-d');
-            $statistiques = ['presents' => 0, 'retards' => 0, 'absents' => 0, 'feries' => 0, 'repos' => 0];
+            $statistiques = ['presents' => 0, 'retards' => 0, 'absents' => 0, 'en_cours' => 0, 'feries' => 0, 'repos' => 0, 'sans_jugement' => 0];
+
+            if ($serviceInterpretation !== null) {
+                $statistiques = $this->statistiquesJourInterpretees(
+                    $serviceInterpretation,
+                    $employeIds,
+                    $jour
+                );
+            } else {
 
             foreach ($employeIds as $employeId) {
                 $jourFerie = $joursFeriesParDate[$jour] ?? null;
@@ -1056,6 +1718,7 @@ class CalculPresenceService
                     default => $statistiques['presents']++,
                 };
             }
+            }
 
             $parJour[] = [
                 'date' => $jour,
@@ -1066,6 +1729,40 @@ class CalculPresenceService
         }
 
         return $this->construireStatistiquesPresence($parJour, $dateDebut, $dateFin, $granularite);
+    }
+
+    /**
+     * @param list<int> $employeIds
+     * @return array{presents:int,retards:int,absents:int,en_cours:int,feries:int,repos:int,sans_jugement:int}
+     */
+    private function statistiquesJourInterpretees(self $service, array $employeIds, string $date): array
+    {
+        $statistiques = ['presents' => 0, 'retards' => 0, 'absents' => 0, 'en_cours' => 0, 'feries' => 0, 'repos' => 0, 'sans_jugement' => 0];
+        foreach ($employeIds as $employeId) {
+            $resultat = $service->interpreterJournee($employeId, $date);
+            $statut = (string) ($resultat['statut_global'] ?? $resultat['statut'] ?? 'ANORMAL');
+            if (in_array($resultat['details']['evaluation'] ?? null, ['AUCUN_JUGEMENT', 'SANS_JUGEMENT'], true)) {
+                $statistiques['sans_jugement']++;
+                continue;
+            }
+            if ($statut === 'REPOS' || ($resultat['details']['evaluation'] ?? null) === 'REPOS') {
+                $statistiques['repos']++;
+                continue;
+            }
+            if ($statut === 'FERIE') {
+                $statistiques['feries']++;
+                continue;
+            }
+
+            match ($statut) {
+                'ABSENT' => $statistiques['absents']++,
+                'RETARD' => $statistiques['retards']++,
+                'EN_COURS' => $statistiques['en_cours']++,
+                default => $statistiques['presents']++,
+            };
+        }
+
+        return $statistiques;
     }
 
     /**
@@ -1261,11 +1958,11 @@ class CalculPresenceService
         string $dateFin,
         string $granularite
     ): array {
-        $totaux = ['presents' => 0, 'retards' => 0, 'absents' => 0, 'feries' => 0, 'repos' => 0, 'total' => 0];
+        $totaux = ['presents' => 0, 'retards' => 0, 'absents' => 0, 'en_cours' => 0, 'feries' => 0, 'repos' => 0, 'sans_jugement' => 0, 'total' => 0];
         $groupes = [];
 
         foreach ($parJour as $ligne) {
-            foreach (['presents', 'retards', 'absents', 'feries', 'repos', 'total'] as $cle) {
+            foreach (['presents', 'retards', 'absents', 'en_cours', 'feries', 'repos', 'sans_jugement', 'total'] as $cle) {
                 $totaux[$cle] += $ligne[$cle];
             }
             $cleGroupe = match ($granularite) {
@@ -1273,8 +1970,8 @@ class CalculPresenceService
                 'mois' => substr($ligne['date'], 0, 7) . '-01',
                 default => $ligne['date'],
             };
-            $groupes[$cleGroupe] ??= ['date' => $cleGroupe, 'presents' => 0, 'retards' => 0, 'absents' => 0, 'feries' => 0, 'repos' => 0, 'total' => 0];
-            foreach (['presents', 'retards', 'absents', 'feries', 'repos', 'total'] as $cle) {
+            $groupes[$cleGroupe] ??= ['date' => $cleGroupe, 'presents' => 0, 'retards' => 0, 'absents' => 0, 'en_cours' => 0, 'feries' => 0, 'repos' => 0, 'sans_jugement' => 0, 'total' => 0];
+            foreach (['presents', 'retards', 'absents', 'en_cours', 'feries', 'repos', 'sans_jugement', 'total'] as $cle) {
                 $groupes[$cleGroupe][$cle] += $ligne[$cle];
             }
         }

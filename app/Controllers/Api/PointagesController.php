@@ -12,6 +12,7 @@ use App\Services\EmployeHistoryService;
 use App\Services\HoraireService;
 use App\Services\TenantTimezoneService;
 use App\Services\PointageTypeService;
+use CodeIgniter\Database\BaseConnection;
 use CodeIgniter\HTTP\ResponseInterface;
 use Config\Database;
 use DateTimeImmutable;
@@ -172,6 +173,218 @@ class PointagesController extends BaseApiController
 
             return $this->errorResponse('Impossible de calculer les statistiques de présence.', 500);
         }
+    }
+
+    /** Recalcule les projections d'une journée dans le périmètre du tenant courant. */
+    public function recalculerJournee(): ResponseInterface
+    {
+        $claims = $this->claims();
+        if ($claims === null) {
+            return $this->errorResponse('Jeton invalide ou expiré.', 401);
+        }
+        if (! $this->canManage()) {
+            return $this->errorResponse('Droits de gestion requis.', 403);
+        }
+
+        $tenantId = $this->tenantId();
+        if ($tenantId === null) {
+            return $this->authorizationError();
+        }
+
+        $input = $this->jsonInput();
+        if (array_diff(array_keys($input), ['date', 'employe_id', 'action']) !== []) {
+            return $this->errorResponse('Filtres de recalcul invalides.', 400);
+        }
+        $action = (string) ($input['action'] ?? 'recalculer');
+        if (! in_array($action, ['recalculer', 'previsualiser'], true)) {
+            return $this->errorResponse('Action de présence invalide.', 422);
+        }
+        $date = $input['date'] ?? null;
+        if (! is_string($date) || ! $this->dateValide($date)) {
+            return $this->errorResponse('La date doit respecter le format AAAA-MM-JJ.', 422);
+        }
+        $employeId = null;
+        if (array_key_exists('employe_id', $input) && $input['employe_id'] !== null && $input['employe_id'] !== '') {
+            $employeValide = filter_var($input['employe_id'], FILTER_VALIDATE_INT);
+            if ($employeValide === false || $employeValide < 1) {
+                return $this->errorResponse('Identifiant employé invalide.', 422);
+            }
+            $employeId = (int) $employeValide;
+        }
+        if ($action === 'previsualiser' && $employeId === null) {
+            return $this->errorResponse('Un employé doit être sélectionné pour prévisualiser une journée.', 422);
+        }
+
+        $db = $this->attendanceDatabase();
+        $requete = $db->table('employes')
+            ->select('id')
+            ->where('tenant_id', $tenantId)
+            ->where('actif', 1)
+            ->where('deleted_at', null);
+        if ($employeId !== null) {
+            $requete->where('id', $employeId);
+        }
+        $employes = $requete->orderBy('id', 'ASC')->get()->getResultArray();
+        if ($employes === []) {
+            return $this->errorResponse(
+                $employeId === null ? 'Aucun employé actif à recalculer.' : 'Employé actif introuvable pour ce tenant.',
+                404
+            );
+        }
+        if ($action === 'previsualiser') {
+            try {
+                $resultat = $this->presenceCalculator($db)->interpreterJournee($employeId, $date);
+            } catch (Throwable $exception) {
+                log_message('error', 'Prévisualisation de présence impossible pour le tenant #{tenant}, employé #{employe}, date {date}: {message}', [
+                    'tenant' => $tenantId,
+                    'employe' => $employeId,
+                    'date' => $date,
+                    'message' => $exception->getMessage(),
+                ]);
+
+                return $this->errorResponse('Impossible de prévisualiser cette journée.', 500);
+            }
+
+            return $this->successResponse([
+                'date' => $date,
+                'employe_id' => $employeId,
+                'resultat' => $resultat,
+            ]);
+        }
+        if ($employeId === null && count($employes) > 1000) {
+            return $this->errorResponse(
+                'Le recalcul tenant-wide est limité à 1000 employés par requête. Sélectionnez un employé.',
+                413
+            );
+        }
+
+        $service = $this->presenceCalculator($db);
+        $traitees = 0;
+        $ignorees = 0;
+        $erreurs = [];
+        foreach ($employes as $employe) {
+            $id = (int) $employe['id'];
+            try {
+                if ($service->recalculerJournee($id, $date) > 0) {
+                    $traitees++;
+                } else {
+                    $ignorees++;
+                }
+            } catch (Throwable $exception) {
+                log_message('error', 'Recalcul de présence impossible pour le tenant #{tenant}, employé #{employe}, date {date}: {message}', [
+                    'tenant' => $tenantId,
+                    'employe' => $id,
+                    'date' => $date,
+                    'message' => $exception->getMessage(),
+                ]);
+                $erreurs[] = ['employe_id' => $id, 'message' => 'Le calcul de cette journée a échoué.'];
+            }
+        }
+
+        return $this->successResponse([
+            'date' => $date,
+            'portee' => $employeId === null ? 'TENANT' : 'EMPLOYE',
+            'employe_id' => $employeId,
+            'total' => count($employes),
+            'traitees' => $traitees,
+            'ignorees' => $ignorees,
+            'erreurs' => $erreurs,
+        ], 'Recalcul terminé.');
+    }
+
+    /** Compare l’interprétation actuelle et une proposition sans enregistrer de projection. */
+    public function comparerReglesJournee(): ResponseInterface
+    {
+        if ($this->claims() === null) {
+            return $this->errorResponse('Jeton invalide ou expiré.', 401);
+        }
+        if (! $this->canManage()) {
+            return $this->errorResponse('Droits de gestion requis.', 403);
+        }
+        $tenantId = $this->tenantId();
+        if ($tenantId === null) {
+            return $this->authorizationError();
+        }
+
+        $input = $this->jsonInput();
+        $champs = ['date_debut', 'date_fin', 'employe_id', 'horaire_id', 'actif_regles_nouvelles', 'parametres', 'creneaux'];
+        if (array_diff(array_keys($input), $champs) !== []
+            || ! is_array($input['parametres'] ?? null)
+            || ! is_array($input['creneaux'] ?? null)
+        ) {
+            return $this->errorResponse('Configuration de comparaison invalide.', 422);
+        }
+        $debut = $input['date_debut'] ?? null;
+        $fin = $input['date_fin'] ?? null;
+        $employeId = filter_var($input['employe_id'] ?? null, FILTER_VALIDATE_INT);
+        $horaireId = $input['horaire_id'] ?? null;
+        if (! is_string($debut) || ! $this->dateValide($debut)
+            || ! is_string($fin) || ! $this->dateValide($fin)
+            || $debut > $fin
+            || $employeId === false || $employeId < 1
+            || ($horaireId !== null && (filter_var($horaireId, FILTER_VALIDATE_INT) === false || (int) $horaireId < 1))
+            || ! in_array($input['actif_regles_nouvelles'] ?? null, [0, 1, '0', '1', false, true], true)
+        ) {
+            return $this->errorResponse('Employé, période ou activation invalide.', 422);
+        }
+        if ((int) (new DateTimeImmutable($debut))->diff(new DateTimeImmutable($fin))->days > 30) {
+            return $this->errorResponse('La période de comparaison ne peut pas dépasser 31 jours.', 422);
+        }
+
+        $db = $this->attendanceDatabase();
+        if (! $this->employeAppartientAuTenant((int) $employeId, $tenantId)) {
+            return $this->errorResponse('Employé introuvable pour ce tenant.', 404);
+        }
+        $service = $this->presenceCalculator($db);
+        $jours = [];
+        $date = new DateTimeImmutable($debut);
+        $dateFin = new DateTimeImmutable($fin);
+        try {
+            while ($date <= $dateFin) {
+                $jours[] = $service->comparerJourneeAvecRegles(
+                    (int) $employeId,
+                    $date->format('Y-m-d'),
+                    $horaireId === null ? null : (int) $horaireId,
+                    in_array($input['actif_regles_nouvelles'], [1, '1', true], true),
+                    $input['parametres'],
+                    $input['creneaux']
+                );
+                $date = $date->modify('+1 day');
+            }
+        } catch (\InvalidArgumentException|\UnexpectedValueException $exception) {
+            return $this->errorResponse($exception->getMessage(), 422);
+        } catch (Throwable $exception) {
+            log_message('error', 'Comparaison des règles impossible pour le tenant #{tenant}, employé #{employe}: {message}', [
+                'tenant' => $tenantId,
+                'employe' => $employeId,
+                'message' => $exception->getMessage(),
+            ]);
+
+            return $this->errorResponse('Impossible de comparer ces règles sur la période sélectionnée.', 500);
+        }
+
+        return $this->successResponse([
+            'date_debut' => $debut,
+            'date_fin' => $fin,
+            'employe_id' => (int) $employeId,
+            'jours_compares' => count($jours),
+            'jours_differents' => count(array_filter($jours, static fn (array $jour): bool => $jour['different'])),
+            'avertissement_pointages_pause' => (bool) array_filter(
+                $jours,
+                static fn (array $jour): bool => $jour['pointages_pause_observes'] && ! $jour['creneaux_pause_configures']
+            ),
+            'jours' => $jours,
+        ]);
+    }
+
+    protected function attendanceDatabase(): BaseConnection
+    {
+        return Database::connect();
+    }
+
+    protected function presenceCalculator(BaseConnection $db): CalculPresenceService
+    {
+        return new CalculPresenceService(null, $db);
     }
 
     public function export(): ResponseInterface
@@ -369,7 +582,7 @@ class PointagesController extends BaseApiController
 
         if ($personnel) {
             $journee = (new CalculPresenceService(new HoraireService($db), $db))
-                ->calculerJournee((int) $employeId, $date->format('Y-m-d'));
+                ->interpreterJournee((int) $employeId, $date->format('Y-m-d'));
             $prochainPointage = null;
             foreach ($journee['analyse_plages'] ?? [] as $plage) {
                 if (($plage['statut'] ?? null) === 'MANQUANT') {
@@ -722,7 +935,7 @@ class PointagesController extends BaseApiController
         }
 
         try {
-            return $this->successResponse((new CalculPresenceService())->calculerJournee($employeId, $date));
+            return $this->successResponse((new CalculPresenceService())->interpreterJournee($employeId, $date));
         } catch (Throwable $e) {
             log_message('error', 'Calcul présence employé #{id} impossible : {error}', ['id' => $employeId, 'error' => $e->getMessage()]);
             return $this->errorResponse('Impossible de calculer cette présence.', 500);

@@ -4,7 +4,7 @@ namespace App\Commands;
 
 use CodeIgniter\CLI\BaseCommand;
 use CodeIgniter\CLI\CLI;
-use Config\Database;
+use App\Services\ApplicationIntegrationSettings;
 use RuntimeException;
 use Throwable;
 
@@ -48,7 +48,7 @@ class GpioComparerMatricules extends BaseCommand
                 throw new RuntimeException('Tenant AMS introuvable.');
             }
 
-            $gpioRows = Database::connect('gpio', false)->table('etau_utilisateur')->get()->getResultArray();
+            $gpioRows = (new ApplicationIntegrationSettings())->gpioConnection()->table('etau_utilisateur')->get()->getResultArray();
             if ($gpioRows === []) {
                 CLI::write('Aucune ligne GPIO trouvée.');
 

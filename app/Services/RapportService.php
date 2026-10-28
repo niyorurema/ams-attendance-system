@@ -92,6 +92,155 @@ class RapportService
         return $requete->orderBy('e.nom')->orderBy('e.prenom')->get()->getResultArray();
     }
 
+    /**
+     * Liste les destinataires automatiques du rapport journalier pour un tenant.
+     *
+     * @return array<int, array{user_id:int,unite_id:?int,unite_nom:?string,nom_complet:string,email:?string,role:string}>
+     */
+    public function listerDestinatairesRapportJournalier(int $tenantId, string $date, ?int $userId = null): array
+    {
+        $rolesResponsables = ['superviseur', 'chef_service', 'directeur', 'commissaire'];
+        $mandats = $this->db->table('unit_chefs m')
+            ->select('m.user_id, m.unite_id, o.nom AS unite_nom, u.nom_complet, u.email, u.role')
+            ->join(
+                'users u',
+                'u.id = m.user_id AND u.tenant_id = m.tenant_id',
+                'inner'
+            )
+            ->join(
+                'unites_organisationnelles o',
+                'o.id = m.unite_id AND o.tenant_id = m.tenant_id AND o.actif = 1 AND o.deleted_at IS NULL',
+                'inner'
+            )
+            ->where('m.tenant_id', $tenantId)
+            ->where('m.est_actif', 1)
+            ->where('m.deleted_at', null)
+            ->where('m.date_debut <=', $date)
+            ->where('u.is_active', 1)
+            ->where('u.deleted_at', null)
+            ->whereIn('u.role', $rolesResponsables)
+            ->groupStart()
+                ->where('m.date_fin', null)
+                ->orWhere('m.date_fin >=', $date)
+            ->groupEnd()
+            ->groupBy(['m.user_id', 'm.unite_id', 'o.nom', 'u.nom_complet', 'u.email', 'u.role'])
+            ->get()
+            ->getResultArray();
+
+        $supplementaires = $this->db->table('rapport_journalier_destinataires_unites d')
+            ->select('d.user_id, d.unite_id, o.nom AS unite_nom, u.nom_complet, u.email, u.role')
+            ->join('users u', 'u.id = d.user_id AND u.tenant_id = d.tenant_id', 'inner')
+            ->join('unites_organisationnelles o', 'o.id = d.unite_id AND o.tenant_id = d.tenant_id', 'left')
+            ->where('d.tenant_id', $tenantId)
+            ->where('u.is_active', 1)
+            ->where('u.deleted_at', null)
+            ->get()
+            ->getResultArray();
+
+        $destinatairesUniques = [];
+        foreach (array_merge($mandats, $supplementaires) as $destinataire) {
+            $destinataireUserId = (int) $destinataire['user_id'];
+            if ($userId !== null && $destinataireUserId !== $userId) {
+                continue;
+            }
+
+            $uniteId = $destinataire['unite_id'] === null ? null : (int) $destinataire['unite_id'];
+            $cle = $destinataireUserId . ':' . ($uniteId ?? 'global');
+            $destinatairesUniques[$cle] = [
+                'user_id' => $destinataireUserId,
+                'unite_id' => $uniteId,
+                'unite_nom' => $destinataire['unite_nom'] === null ? null : (string) $destinataire['unite_nom'],
+                'nom_complet' => (string) $destinataire['nom_complet'],
+                'email' => $destinataire['email'] === null ? null : (string) $destinataire['email'],
+                'role' => (string) $destinataire['role'],
+            ];
+        }
+
+        $destinataires = array_values($destinatairesUniques);
+        usort($destinataires, static function (array $gauche, array $droite): int {
+            return strnatcasecmp((string) ($gauche['unite_nom'] ?? ''), (string) ($droite['unite_nom'] ?? ''))
+                ?: strnatcasecmp($gauche['nom_complet'], $droite['nom_complet'])
+                ?: ($gauche['user_id'] <=> $droite['user_id'])
+                ?: (($gauche['unite_id'] ?? 0) <=> ($droite['unite_id'] ?? 0));
+        });
+
+        return $destinataires;
+    }
+
+    public function rapportJournalierDejaArchive(
+        int $tenantId,
+        int $configurationId,
+        int $userId,
+        ?int $uniteId,
+        string $date
+    ): bool {
+        $existant = $this->db->table('rapports_envoyes')
+            ->where('tenant_id', $tenantId)
+            ->where('rapport_journalier_config_id', $configurationId)
+            ->where('user_id', $userId)
+            ->where('rapport_unite_id', $uniteId)
+            ->where('date_rapport', $date)
+            ->whereIn('statut', ['ENVOYE', 'EN_ATTENTE'])
+            ->countAllResults() > 0;
+
+        if (! $existant && $uniteId === null) {
+            $existant = $this->db->table('rapports_envoyes')
+                ->where('tenant_id', $tenantId)
+                ->where('user_id', $userId)
+                ->where('date_rapport', $date)
+                ->whereIn('statut', ['ENVOYE', 'EN_ATTENTE'])
+                ->where('rapport_planifie_id IS NOT NULL', null, false)
+                ->countAllResults() > 0;
+        }
+
+        return $existant;
+    }
+
+    /**
+     * @param array{user_id:int,unite_id:?int} $destinataire
+     * @return array<string, mixed>
+     */
+    public function preparerRapportPourDestinataire(
+        array $destinataire,
+        string $dateRapport,
+        string $dateExecution
+    ): array {
+        return $this->genererRapportQuotidien(
+            $destinataire['user_id'],
+            $dateRapport,
+            $dateExecution,
+            $destinataire['unite_id']
+        );
+    }
+
+    /** @return array<string, true> */
+    public function listerClesRapportsJournaliersArchives(int $tenantId, int $configurationId, string $date): array
+    {
+        $archives = $this->db->table('rapports_envoyes')
+            ->select('user_id, rapport_unite_id, rapport_journalier_config_id, rapport_planifie_id')
+            ->where('tenant_id', $tenantId)
+            ->where('date_rapport', $date)
+            ->whereIn('statut', ['ENVOYE', 'EN_ATTENTE'])
+            ->groupStart()
+                ->where('rapport_journalier_config_id', $configurationId)
+                ->orWhere('rapport_planifie_id IS NOT NULL', null, false)
+            ->groupEnd()
+            ->get()
+            ->getResultArray();
+
+        $cles = [];
+        foreach ($archives as $archive) {
+            if ((int) ($archive['rapport_journalier_config_id'] ?? 0) === $configurationId) {
+                $uniteId = $archive['rapport_unite_id'] === null ? null : (int) $archive['rapport_unite_id'];
+                $cles[(int) $archive['user_id'] . ':' . ($uniteId ?? 'global')] = true;
+            } elseif ($archive['rapport_planifie_id'] !== null) {
+                $cles[(int) $archive['user_id'] . ':global'] = true;
+            }
+        }
+
+        return $cles;
+    }
+
     /** @return array<string, mixed> */
     public function genererRapportQuotidien(
         int $userId,
@@ -114,13 +263,19 @@ class RapportService
             'anormaux' => 0,
             'feries' => 0,
             'repos' => 0,
+            'sans_jugement' => 0,
             'heures_totales' => 0.0,
         ];
         $jourTenant = (new JourTravailleService())->verifierJour((int) $contexte['tenant_id'], $date);
         foreach ($this->getEmployesVisibles($userId, $dateMandat ?? $date, $uniteScopeId) as $employe) {
-            $calcul = $this->calculPresenceService->calculerJournee((int) $employe['id'], $date);
+            $calcul = $this->calculPresenceService->interpreterJournee((int) $employe['id'], $date);
             $analyse = $calcul['analyse_plages'];
-            if (empty($calcul['jour_ferie']) || ! empty($calcul['ferie_travail'])) {
+            $sansJugement = in_array(
+                $calcul['details']['evaluation'] ?? null,
+                ['AUCUN_JUGEMENT', 'SANS_JUGEMENT'],
+                true
+            );
+            if (! $sansJugement && (empty($calcul['jour_ferie']) || ! empty($calcul['ferie_travail']))) {
                 $employesPlanifies++;
             }
             $details[] = [
@@ -151,21 +306,44 @@ class RapportService
                 'jour_ferie_nom' => $calcul['jour_ferie_nom'] ?? null,
                 'prime_potentielle' => (bool) ($calcul['prime_potentielle'] ?? false),
                 'nb_pointages' => count(array_filter($analyse, static fn (array $plage): bool => $plage['reel'] !== null)),
+                'horaire_nom' => $calcul['horaire_nom'] ?? $calcul['details']['horaire_nom'] ?? null,
+                'source_calcul' => $calcul['source_calcul'] ?? $calcul['details']['source'] ?? null,
+                'creneaux' => $calcul['details']['creneaux'] ?? array_map(
+                    static fn (array $plage): array => [
+                        'creneau' => match ($plage['type'] ?? '') {
+                            'CHECK_IN' => 'ARRIVEE',
+                            'BREAK_OUT' => 'DEBUT_PAUSE',
+                            'BREAK_IN' => 'FIN_PAUSE',
+                            'CHECK_OUT' => 'DEPART',
+                            default => (string) ($plage['type'] ?? 'INCONNU'),
+                        },
+                        'attendu' => $plage['attendu'] ?? null,
+                        'reel' => $plage['reel'] ?? null,
+                        'statut' => $plage['statut'] ?? 'INCONNU',
+                    ],
+                    $analyse
+                ),
             ];
             $stats['total_employes']++;
-            $stats['heures_totales'] += $calcul['heures_travaillees'];
+            if (! $sansJugement) {
+                $stats['heures_totales'] += $calcul['heures_travaillees'];
+            }
             if (! empty($calcul['jour_ferie'])) {
                 $stats['feries']++;
             }
-            match ($calcul['statut']) {
-                'ABSENT' => $stats['absents']++,
-                'NORMAL' => [$stats['presents']++, $stats['normaux']++],
-                'RETARD' => [$stats['presents']++, $stats['retards']++],
-                'EN_COURS' => $stats['presents']++,
-                'FERIE' => null,
-                'REPOS' => $stats['repos']++,
-                default => [$stats['presents']++, $stats['anormaux']++],
-            };
+            if ($sansJugement) {
+                $stats['sans_jugement']++;
+            } else {
+                match ($calcul['statut']) {
+                    'ABSENT' => $stats['absents']++,
+                    'NORMAL' => [$stats['presents']++, $stats['normaux']++],
+                    'RETARD' => [$stats['presents']++, $stats['retards']++],
+                    'EN_COURS' => $stats['presents']++,
+                    'FERIE' => null,
+                    'REPOS' => $stats['repos']++,
+                    default => [$stats['presents']++, $stats['anormaux']++],
+                };
+            }
             foreach ($calcul['pointages_manquants'] as $manquant) {
                 $alertes[] = $employe['nom'] . ' ' . $employe['prenom'] . ' : pointage ' . $manquant . ' manquant';
             }
@@ -182,7 +360,7 @@ class RapportService
             'titre' => 'Rapport de présence du ' . date('d/m/Y', strtotime($date)),
             'destinataire' => ['user_id' => $userId, 'tenant_id' => (int) $contexte['tenant_id'], 'nom' => $contexte['nom_complet'], 'role' => $contexte['role'], 'unite' => $contexte['unite_nom']],
             'date' => $date,
-            'horaire' => 'Standard OBR',
+            'horaire' => 'Horaire déterminé par les affectations de chaque employé',
             'est_jour_travaille' => $jourTenant['travaille'],
             'raison_non_travaille' => $jourTenant['travaille'] ? null : $jourTenant['raison'],
             'stats' => $stats,
@@ -232,6 +410,7 @@ class RapportService
             'absents' => 'Absents',
             'feries' => 'Jours fériés',
             'repos' => 'Jours de repos',
+            'sans_jugement' => 'Sans jugement',
             'normaux' => 'Normaux',
             'retards' => 'Retards',
             'anormaux' => 'Anormaux',
@@ -257,6 +436,7 @@ class RapportService
             'Nom',
             'Prénom',
             'Unité',
+            'Horaire appliqué',
             'Détails pointages',
             'Heure arrivée',
             'Heure départ',
@@ -267,11 +447,13 @@ class RapportService
             'Départ anticipé (min)',
             'Statut',
             'Nombre de pointages',
+            'Source du calcul',
+            'Détail des créneaux',
         ];
         foreach ($entetes as $index => $entete) {
             $this->setTexte($details, Coordinate::stringFromColumnIndex($index + 1) . '1', $entete);
         }
-        $this->styliserEntete($details, 'A1:O1');
+        $this->styliserEntete($details, 'A1:R1');
 
         foreach (($rapport['details'] ?? []) as $index => $detail) {
             $ligne = $index + 2;
@@ -284,20 +466,23 @@ class RapportService
                     . ' ' . (string) ($pointage['heure'] ?? ''),
                 $detail['pointages'] ?? []
             );
-            $this->setTexte($details, 'F' . $ligne, implode(', ', $pointages));
-            $this->setTexte($details, 'G' . $ligne, (string) ($detail['heure_arrivee'] ?? ''));
-            $this->setTexte($details, 'H' . $ligne, (string) ($detail['heure_depart'] ?? ''));
-            $this->setNombre($details, 'I' . $ligne, (float) ($detail['heures_travaillees'] ?? 0));
-            $this->setTexte($details, 'J' . $ligne, (string) ($detail['arrivee_tardive'] ?? ''));
-            $this->setTexte($details, 'K' . $ligne, (string) ($detail['depart_anticipe'] ?? ''));
-            $this->setNombre($details, 'L' . $ligne, (int) ($detail['retard_minutes'] ?? 0));
-            $this->setNombre($details, 'M' . $ligne, (int) ($detail['depart_anticipe_minutes'] ?? 0));
-            $this->setTexte($details, 'N' . $ligne, (string) ($detail['statut'] ?? ''));
-            $this->setNombre($details, 'O' . $ligne, (int) ($detail['nb_pointages'] ?? 0));
+            $this->setTexte($details, 'F' . $ligne, (string) ($detail['horaire_nom'] ?? ''));
+            $this->setTexte($details, 'G' . $ligne, implode(', ', $pointages));
+            $this->setTexte($details, 'H' . $ligne, (string) ($detail['heure_arrivee'] ?? ''));
+            $this->setTexte($details, 'I' . $ligne, (string) ($detail['heure_depart'] ?? ''));
+            $this->setNombre($details, 'J' . $ligne, (float) ($detail['heures_travaillees'] ?? 0));
+            $this->setTexte($details, 'K' . $ligne, (string) ($detail['arrivee_tardive'] ?? ''));
+            $this->setTexte($details, 'L' . $ligne, (string) ($detail['depart_anticipe'] ?? ''));
+            $this->setNombre($details, 'M' . $ligne, (int) ($detail['retard_minutes'] ?? 0));
+            $this->setNombre($details, 'N' . $ligne, (int) ($detail['depart_anticipe_minutes'] ?? 0));
+            $this->setTexte($details, 'O' . $ligne, (string) ($detail['statut'] ?? ''));
+            $this->setNombre($details, 'P' . $ligne, (int) ($detail['nb_pointages'] ?? 0));
+            $this->setTexte($details, 'Q' . $ligne, (string) ($detail['source_calcul'] ?? ''));
+            $this->setTexte($details, 'R' . $ligne, json_encode($detail['creneaux'] ?? [], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
         }
         $details->freezePane('A2');
-        $details->setAutoFilter('A1:O' . max(1, count($rapport['details'] ?? []) + 1));
-        foreach (range('A', 'O') as $colonne) {
+        $details->setAutoFilter('A1:R' . max(1, count($rapport['details'] ?? []) + 1));
+        foreach (range('A', 'R') as $colonne) {
             $details->getColumnDimension($colonne)->setAutoSize(true);
         }
 
@@ -354,6 +539,9 @@ class RapportService
         $format = strtoupper($format);
         $langue = in_array($langue, ['fr', 'en', 'rn'], true) ? $langue : 'fr';
         $tenantId = (int) ($rapport['destinataire']['tenant_id'] ?? 0);
+        if (! $this->configurationRapportJournalierActive($tenantId, $rapportJournalierConfigId)) {
+            throw new \RuntimeException('Les envois de rapports sont désactivés pour ce tenant.');
+        }
         $user = $this->db->table('users')
             ->select('id, tenant_id, email, nom_complet')
             ->where('id', $userId)
@@ -399,19 +587,26 @@ class RapportService
         $fichier = null;
         try {
             $fichier = $format === 'PDF' ? $this->genererPDF($rapport) : $this->genererExcel($rapport);
+            $smtp = (new ApplicationIntegrationSettings())->smtpConfiguration();
+            if (! $smtp['enabled'] || trim((string) $smtp['host']) === '') {
+                throw new \RuntimeException('Le serveur SMTP doit être configuré et activé dans Paramètres > Intégrations.');
+            }
+            if (! filter_var($smtp['from_email'], FILTER_VALIDATE_EMAIL)) {
+                throw new \RuntimeException('L’adresse d’expédition SMTP est invalide; configurez-la dans Paramètres > Intégrations.');
+            }
             $mail = new PHPMailer(true);
             $mail->isSMTP();
-            $mail->Host = (string) env('EMAIL_HOST', '');
-            $mail->Port = (int) env('EMAIL_PORT', 25);
-            $mail->SMTPAuth = (string) env('EMAIL_USER', '') !== '';
-            $mail->Username = (string) env('EMAIL_USER', '');
-            $mail->Password = (string) env('EMAIL_PASS', '');
-            $chiffrement = strtolower((string) env('EMAIL_ENCRYPTION', 'tls'));
-            $mail->SMTPSecure = $chiffrement === 'ssl'
+            $mail->Host = (string) $smtp['host'];
+            $mail->Port = (int) $smtp['port'];
+            $mail->SMTPAuth = (string) $smtp['username'] !== '';
+            $mail->Username = (string) $smtp['username'];
+            $mail->Password = (string) $smtp['password'];
+            $mail->Timeout = 10;
+            $mail->SMTPSecure = $smtp['encryption'] === 'ssl'
                 ? PHPMailer::ENCRYPTION_SMTPS
-                : ($chiffrement === 'tls' ? PHPMailer::ENCRYPTION_STARTTLS : '');
+                : ($smtp['encryption'] === 'tls' ? PHPMailer::ENCRYPTION_STARTTLS : '');
             $mail->CharSet = PHPMailer::CHARSET_UTF8;
-            $mail->setFrom((string) env('EMAIL_FROM', ''), (string) env('EMAIL_FROM_NAME', 'AMS'));
+            $mail->setFrom((string) $smtp['from_email'], (string) $smtp['from_name']);
             $mail->addAddress((string) $user['email'], (string) $user['nom_complet']);
             $mail->isHTML(true);
             $mail->Subject = $this->sujetRapport((string) ($rapport['date'] ?? ''), $langue);
@@ -468,24 +663,7 @@ class RapportService
      *
      * @return array<string, int>
      */
-    public function envoyerRapportsQuotidiens(): array
-    {
-        $result = $this->envoyerRapportsAutomatiquesParTenant();
-        $legacy = $this->envoyerRapportsParType('QUOTIDIEN');
-
-        foreach ($result as $key => $value) {
-            $result[$key] += $legacy[$key] ?? 0;
-        }
-
-        return $result;
-    }
-
-    /**
-     * Envoie le rapport J-1 selon la configuration et les jours travaillés du tenant.
-     *
-     * @return array<string, int>
-     */
-    protected function envoyerRapportsAutomatiquesParTenant(): array
+    public function contexteRapportsQuotidiens(): array
     {
         $configs = $this->db->table('rapport_journalier_configs c')
             ->select('c.*')
@@ -495,128 +673,142 @@ class RapportService
             ->where('t.deleted_at', null)
             ->get()
             ->getResultArray();
-        $result = ['traite' => 0, 'envoyes' => 0, 'ignores' => 0, 'erreurs' => 0];
+        $context = [];
         $joursTravailles = new JourTravailleService();
-
+        $joursFeries = new JourFerieService();
         foreach ($configs as $config) {
             $tenantId = (int) $config['tenant_id'];
-            $maintenant = (new TenantTimezoneService($this->db))->now($tenantId);
-            if ((string) $config['heure_envoi'] > $maintenant->format('H:i:s')) {
+            $now = (new TenantTimezoneService($this->db))->now($tenantId);
+            if ((string) $config['heure_envoi'] > $now->format('H:i:s')) {
+                continue;
+            }
+            $executionDate = $now->format('Y-m-d');
+            $reportDate = $now->modify('-1 day')->format('Y-m-d');
+            $context[] = [
+                'tenant_id' => $tenantId,
+                'configuration_id' => (int) $config['id'],
+                'date_execution' => $executionDate,
+                'date_rapport' => $reportDate,
+                'eligible' => $joursTravailles->estTravaille($tenantId, $executionDate)
+                    && $joursFeries->getJourFerie($tenantId, $reportDate) === null,
+                'format' => (string) $config['format'],
+                'langue' => (string) $config['langue'],
+                'recipients' => array_map(
+                    static fn (array $recipient): array => [
+                        'user_id' => $recipient['user_id'],
+                        'unite_id' => $recipient['unite_id'],
+                    ],
+                    $this->listerDestinatairesRapportJournalier($tenantId, $executionDate)
+                ),
+            ];
+        }
+
+        return $context;
+    }
+
+    /**
+     * @param ?array<int, array<string,mixed>> $retryContext Immutable tenant/date/recipient parameters from the source run.
+     * @return array<string, int>
+     */
+    public function envoyerRapportsQuotidiens(?array $retryContext = null): array
+    {
+        $context = $retryContext ?? $this->contexteRapportsQuotidiens();
+        $result = ['traite' => 0, 'envoyes' => 0, 'ignores' => 0, 'erreurs' => 0];
+
+        foreach ($context as $entry) {
+            $tenantId = (int) ($entry['tenant_id'] ?? 0);
+            $configId = (int) ($entry['configuration_id'] ?? 0);
+            $executionDate = (string) ($entry['date_execution'] ?? '');
+            $reportDate = (string) ($entry['date_rapport'] ?? '');
+            if ($tenantId < 1 || $configId < 1
+                || ! $this->dateRapportValide($executionDate)
+                || ! $this->dateRapportValide($reportDate)
+                || ! is_bool($entry['eligible'] ?? null)
+                || ! in_array($entry['format'] ?? null, ['PDF', 'EXCEL'], true)
+                || ! in_array($entry['langue'] ?? null, ['fr', 'en', 'rn'], true)
+                || ! is_array($entry['recipients'] ?? null)
+            ) {
+                throw new \InvalidArgumentException('Le contexte de relance des rapports est invalide.');
+            }
+
+            $config = $this->db->table('rapport_journalier_configs c')
+                ->select('c.*')
+                ->join('tenants t', 't.id = c.tenant_id')
+                ->where('c.id', $configId)
+                ->where('c.tenant_id', $tenantId)
+                ->where('c.actif', 1)
+                ->where('t.is_active', 1)
+                ->where('t.deleted_at', null)
+                ->get()
+                ->getRowArray();
+            if ($config === null) {
+                $result['ignores']++;
                 continue;
             }
             $result['traite']++;
-            $aujourdhui = $maintenant->format('Y-m-d');
-            $dateRapport = $maintenant->modify('-1 day')->format('Y-m-d');
-            if (! $joursTravailles->estTravaille($tenantId, $aujourdhui)) {
+            if (! $entry['eligible']) {
                 $result['ignores']++;
                 continue;
             }
-
-            $jourFerie = (new JourFerieService())->getJourFerie($tenantId, $dateRapport);
-            if ($jourFerie !== null) {
-                $result['ignores']++;
-                continue;
-            }
-
-            $responsables = $this->db->table('unit_chefs m')
-                ->select('m.user_id, m.unite_id')
-                ->join('users u', 'u.id = m.user_id AND u.tenant_id = m.tenant_id', 'inner')
-                ->join('unites_organisationnelles o', 'o.id = m.unite_id AND o.tenant_id = m.tenant_id AND o.actif = 1 AND o.deleted_at IS NULL', 'inner')
-                ->where('m.tenant_id', $tenantId)
-                ->where('m.est_actif', 1)
-                ->where('m.deleted_at', null)
-                ->where('m.date_debut <=', $aujourdhui)
-                ->where('u.is_active', 1)
-                ->where('u.deleted_at', null)
-                ->groupStart()
-                    ->where('m.date_fin', null)
-                    ->orWhere('m.date_fin >=', $aujourdhui)
-                ->groupEnd()
-                ->groupBy(['m.user_id', 'm.unite_id'])
-                ->get()
-                ->getResultArray();
-            $destinataires = array_map(static fn (array $row): array => [
-                'user_id' => (int) $row['user_id'],
-                'unite_id' => (int) $row['unite_id'],
-            ], $responsables);
-            $supplementaires = $this->db->table('rapport_journalier_destinataires_unites')
-                ->select('user_id, unite_id')
-                ->where('tenant_id', $tenantId)
-                ->get()
-                ->getResultArray();
-            $destinataires = array_merge($destinataires, array_map(static fn (array $row): array => [
-                'user_id' => (int) $row['user_id'],
-                'unite_id' => $row['unite_id'] === null ? null : (int) $row['unite_id'],
-            ], $supplementaires));
-            $destinatairesUniques = [];
-            foreach ($destinataires as $destinataire) {
-                $cle = $destinataire['user_id'] . ':' . ($destinataire['unite_id'] ?? 'global');
-                $destinatairesUniques[$cle] = $destinataire;
-            }
-            $destinataires = array_values($destinatairesUniques);
-            if ($destinataires === []) {
-                log_message('error', 'Aucun destinataire configuré pour le rapport journalier du tenant {tenant}.', [
+            if ($entry['recipients'] === []) {
+                log_message('error', 'Aucun destinataire enregistré pour le rapport journalier du tenant {tenant}.', [
                     'tenant' => $tenantId,
                 ]);
                 $result['erreurs']++;
                 continue;
             }
 
-            foreach ($destinataires as $destinataire) {
-                $userId = $destinataire['user_id'];
-                $uniteId = $destinataire['unite_id'];
-                $envoiExistant = $this->db->table('rapports_envoyes')
-                    ->where('tenant_id', $tenantId)
-                    ->where('rapport_journalier_config_id', (int) $config['id'])
-                    ->where('user_id', $userId)
-                    ->where('rapport_unite_id', $uniteId)
-                    ->where('date_rapport', $dateRapport)
-                    ->whereIn('statut', ['ENVOYE', 'EN_ATTENTE'])
-                    ->countAllResults() > 0;
-                if (! $envoiExistant && $uniteId === null) {
-                    $envoiExistant = $this->db->table('rapports_envoyes')
-                        ->where('tenant_id', $tenantId)
-                        ->where('user_id', $userId)
-                        ->where('date_rapport', $dateRapport)
-                        ->whereIn('statut', ['ENVOYE', 'EN_ATTENTE'])
-                        ->where('rapport_planifie_id IS NOT NULL', null, false)
-                        ->countAllResults() > 0;
+            foreach ($entry['recipients'] as $recipient) {
+                $userId = (int) ($recipient['user_id'] ?? 0);
+                $unitId = isset($recipient['unite_id']) ? (int) $recipient['unite_id'] : null;
+                if ($userId < 1 || (isset($recipient['unite_id']) && $unitId < 1)) {
+                    throw new \InvalidArgumentException('Un destinataire du contexte de relance est invalide.');
                 }
-                if ($envoiExistant) {
+                if ($this->rapportJournalierDejaArchive($tenantId, $configId, $userId, $unitId, $reportDate)) {
                     $result['ignores']++;
                     continue;
                 }
 
                 try {
-                    $rapport = $this->genererRapportQuotidien($userId, $dateRapport, $aujourdhui, $uniteId);
+                    $report = $this->preparerRapportPourDestinataire(
+                        ['user_id' => $userId, 'unite_id' => $unitId],
+                        $reportDate,
+                        $executionDate
+                    );
                     if (! $this->envoyerEmail(
                         $userId,
-                        $rapport,
-                        (string) $config['format'],
-                        (string) $config['langue'],
+                        $report,
+                        (string) $entry['format'],
+                        (string) $entry['langue'],
                         null,
-                        (int) $config['id'],
-                        $uniteId
+                        $configId,
+                        $unitId
                     )) {
                         throw new \RuntimeException('L’envoi du rapport journalier a échoué.');
                     }
                     $result['envoyes']++;
-                } catch (\Throwable $e) {
+                } catch (\Throwable $exception) {
                     log_message('error', 'Échec du rapport journalier du tenant {tenant}, destinataire {user} : {error}', [
                         'tenant' => $tenantId,
                         'user' => $userId,
-                        'error' => $e->getMessage(),
+                        'error' => $exception->getMessage(),
                     ]);
                     $result['erreurs']++;
                 }
             }
 
             $this->db->table('rapport_journalier_configs')
-                ->where('id', (int) $config['id'])
+                ->where('id', $configId)
                 ->update(['updated_at' => date('Y-m-d H:i:s')]);
         }
 
         return $result;
+    }
+
+    private function dateRapportValide(string $date): bool
+    {
+        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d', $date);
+        return $parsed !== false && $parsed->format('Y-m-d') === $date;
     }
 
     /**
@@ -627,6 +819,10 @@ class RapportService
      */
     public function envoyerRapportsParType(string $type): array
     {
+        if ($type === 'QUOTIDIEN') {
+            return $this->envoyerRapportsQuotidiens();
+        }
+
         $dateAujourdhui = date('Y-m-d');
         $heureActuelle = date('H:i:s');
 
@@ -705,7 +901,11 @@ class RapportService
      */
     protected function envoyerRapportPlanifie(array $planification, string $dateRapport): array
     {
-        $rapport = $this->genererRapportQuotidien((int) $planification['user_id'], $dateRapport);
+        $rapport = $this->preparerRapportPourDestinataire(
+            ['user_id' => (int) $planification['user_id'], 'unite_id' => null],
+            $dateRapport,
+            $dateRapport
+        );
         if (! $this->envoyerEmail(
             (int) $planification['user_id'],
             $rapport,
@@ -724,6 +924,27 @@ class RapportService
             ]);
 
         return $rapport;
+    }
+
+    private function configurationRapportJournalierActive(int $tenantId, ?int $configurationId = null): bool
+    {
+        if ($tenantId < 1) {
+            return false;
+        }
+
+        $query = $this->db->table('rapport_journalier_configs')
+            ->where('tenant_id', $tenantId)
+            ->where('actif', 1);
+        if ($configurationId !== null) {
+            $query->where('id', $configurationId);
+        }
+
+        return $query->countAllResults() > 0;
+    }
+
+    public function envoiRapportActifPourTenant(int $tenantId): bool
+    {
+        return $this->configurationRapportJournalierActive($tenantId);
     }
 
     /** @return ?array<string, mixed> */

@@ -2,8 +2,8 @@
 
 namespace Tests\Feature;
 
+use App\Services\ApplicationIntegrationSettings;
 use CodeIgniter\Test\CIUnitTestCase;
-use Config\Database;
 
 /**
  * Vérifie la connexion en lecture seule à la base source GPIO.
@@ -23,14 +23,11 @@ class GpioDatabaseConnectionTest extends CIUnitTestCase
 
     public function testGpioConnectionCanReadSourceTables(): void
     {
-        $config = config('Database');
-        $this->assertSame('10.100.10.21', $config->gpio['hostname']);
-        $this->assertSame('etau', $config->gpio['database']);
-        $this->assertSame('ezechiel', $config->gpio['username']);
-
-        $db = Database::connect('gpio', false);
+        $settings = new ApplicationIntegrationSettings();
+        $configuredDatabase = $settings->systemSettings()['gpio']['database'];
+        $db = $settings->gpioConnection();
         $database = $db->query('SELECT DATABASE() AS database_name')->getRowArray();
-        $this->assertSame($config->gpio['database'], $database['database_name'] ?? null);
+        $this->assertSame($configuredDatabase, $database['database_name'] ?? null);
 
         foreach (['etau_service', 'etau_utilisateur', 'etau_service_chef'] as $table) {
             $result = $db->query('SELECT 1 FROM ' . $db->protectIdentifiers($table) . ' LIMIT 1');

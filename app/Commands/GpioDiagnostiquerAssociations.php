@@ -4,7 +4,7 @@ namespace App\Commands;
 
 use CodeIgniter\CLI\BaseCommand;
 use CodeIgniter\CLI\CLI;
-use Config\Database;
+use App\Services\ApplicationIntegrationSettings;
 use RuntimeException;
 use Throwable;
 
@@ -39,7 +39,7 @@ class GpioDiagnostiquerAssociations extends BaseCommand
                 throw new RuntimeException('Tenant AMS introuvable.');
             }
 
-            $gpio = Database::connect('gpio', false);
+            $gpio = (new ApplicationIntegrationSettings())->gpioConnection();
             $allUsers = $gpio->table('etau_utilisateur')->get()->getResultArray();
             $typeColumn = $this->column($allUsers, ['typeObjet', 'type_objet']);
             $idColumn = $this->column($allUsers, ['utilisateur_id', 'utilisateurID', 'userID', 'id_utilisateur', 'id']);

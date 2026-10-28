@@ -10,7 +10,7 @@ CodeIgniter\Boot::bootConsole($paths);
 echo "=== Test connexion GPIO ===\n\n";
 
 try {
-    $gpioDb = \Config\Database::connect('gpio');
+    $gpioDb = (new \App\Services\ApplicationIntegrationSettings())->gpioConnection();
     echo "✅ Connexion établie\n\n";
     
     $count = $gpioDb->table('etau_service')->countAllResults();

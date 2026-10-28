@@ -11,7 +11,6 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
     public function testTenantSansOptInDelegueAuCalculHistorique(): void
     {
         $service = $this->creerService(actif: false);
-
         $this->assertSame(['legacy' => true], $service->interpreterJournee(5, '2026-10-12'));
     }
 
@@ -20,6 +19,30 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
         $service = $this->creerService(actif: true, creneaux: []);
 
         $this->assertSame(['legacy' => true], $service->interpreterJournee(5, '2026-10-12'));
+    }
+
+    public function testJourFerieNonTravailleNeComptePasCommeAbsenceAvecNouvellesRegles(): void
+    {
+        $resultat = $this->creerService(
+            creneaux: $this->quatreCreneaux(),
+            jourFerie: ['nom' => 'Noël', 'travaille' => 0]
+        )->interpreterJournee(5, '2026-10-12');
+
+        $this->assertSame('FERIE', $resultat['statut_global']);
+        $this->assertSame('Noël', $resultat['jour_ferie_nom']);
+        $this->assertSame('JOUR_FERIE', $resultat['details']['evaluation']);
+    }
+
+    public function testJourFerieTravailleSansPointageNeDevientPasUneAbsenceAvecNouvellesRegles(): void
+    {
+        $resultat = $this->creerService(
+            creneaux: $this->quatreCreneaux(),
+            jourFerie: ['nom' => 'Fête nationale', 'travaille' => 1]
+        )->interpreterJournee(5, '2026-10-12');
+
+        $this->assertSame('FERIE', $resultat['statut_global']);
+        $this->assertTrue($resultat['ferie_travail']);
+        $this->assertFalse($resultat['prime_potentielle']);
     }
 
     public function testArriveeAvantLimiteEstPresenteEtArriveeTardiveEstEnRetard(): void
@@ -35,6 +58,50 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
             pointages: [['type_evenement' => 'CHECK_IN', 'date_pointage' => '2026-10-12 07:45:00']]
         );
         $this->assertSame('RETARD', $service->interpreterJournee(5, '2026-10-12')['statut_global']);
+    }
+
+    public function testAbsenceResteEnCoursAvantLaLimiteDeTolerance(): void
+    {
+        $resultat = $this->creerService(
+            creneaux: [$this->creneau('ARRIVEE', 'LIMITE_TARDIVE', '07:30', 10)],
+            maintenant: '2026-10-12 07:40:00'
+        )->interpreterJournee(5, '2026-10-12');
+
+        $this->assertSame('EN_COURS', $resultat['statut_global']);
+        $this->assertSame('AUCUNE_ARRIVEE_AVANT_ECHEANCE', $resultat['details']['evaluation']);
+    }
+
+    public function testAbsenceEstConfirmeeApresLaLimiteDeTolerance(): void
+    {
+        $resultat = $this->creerService(
+            creneaux: [$this->creneau('ARRIVEE', 'LIMITE_TARDIVE', '07:30', 10)],
+            maintenant: '2026-10-12 07:41:00'
+        )->interpreterJournee(5, '2026-10-12');
+
+        $this->assertSame('ABSENT', $resultat['statut_global']);
+    }
+
+    public function testEvenementSansArriveeNeConfirmePasLabsenceAvantLeDelai(): void
+    {
+        $resultat = $this->creerService(
+            creneaux: [$this->creneau('ARRIVEE', 'LIMITE_TARDIVE', '07:30', 10)],
+            pointages: [['type_evenement' => 'BREAK_OUT', 'date_pointage' => '2026-10-12 07:00:00']],
+            maintenant: '2026-10-12 07:35:00'
+        )->interpreterJournee(5, '2026-10-12');
+
+        $this->assertSame('EN_COURS', $resultat['statut_global']);
+    }
+
+    public function testEvenementSansArriveeConfirmeLabsenceApresLeDelai(): void
+    {
+        $resultat = $this->creerService(
+            creneaux: [$this->creneau('ARRIVEE', 'LIMITE_TARDIVE', '07:30', 10)],
+            pointages: [['type_evenement' => 'BREAK_OUT', 'date_pointage' => '2026-10-12 07:00:00']],
+            maintenant: '2026-10-12 07:41:00'
+        )->interpreterJournee(5, '2026-10-12');
+
+        $this->assertSame('ABSENT', $resultat['statut_global']);
+        $this->assertSame('ABSENT', $resultat['statut_arrivee']);
     }
 
     public function testModeHoraireLibreNePorteAucunJugement(): void
@@ -202,7 +269,7 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
             ],
             pointages: [
                 ['type_evenement' => 'BREAK_OUT', 'date_pointage' => '2026-10-12 12:00:00'],
-                ['type_evenement' => 'BREAK_IN', 'date_pointage' => '2026-10-12 14:01:00'],
+                ['type_evenement' => 'BREAK_IN', 'date_pointage' => '2026-10-12 14:11:00'],
             ]
         );
 
@@ -342,14 +409,16 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
         ?array $horaire = null,
         ?array $contrat = null,
         bool $sansJugement = false,
-        array $parametres = []
+        array $parametres = [],
+        ?array $jourFerie = null,
+        ?string $maintenant = null
     ): CalculPresenceService {
         return new class($actif, $creneaux, $pointages, $source, $horaire ?? $this->horaire([
             ['type' => 'CHECK_IN', 'debut' => '07:30', 'fin' => '08:00'],
             ['type' => 'BREAK_OUT', 'debut' => '12:00', 'fin' => '12:15'],
             ['type' => 'BREAK_IN', 'debut' => '13:30', 'fin' => '13:45'],
             ['type' => 'CHECK_OUT', 'debut' => '16:30', 'fin' => '17:30'],
-        ]), $contrat, $sansJugement, $parametres) extends CalculPresenceService {
+        ]), $contrat, $sansJugement, $parametres, $jourFerie, $maintenant) extends CalculPresenceService {
             public function __construct(
                 private bool $actif,
                 private array $creneaux,
@@ -358,8 +427,15 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
                 private array $horaire,
                 private ?array $contrat,
                 private bool $sansJugement,
-                private array $parametres
+                private array $parametres,
+                private ?array $jourFerie,
+                private ?string $maintenant
             ) {
+            }
+
+            protected function maintenantTenant(int $tenantId): DateTimeImmutable
+            {
+                return new DateTimeImmutable($this->maintenant ?? '2026-10-12 12:00:00', new DateTimeZone('Africa/Bujumbura'));
             }
 
             protected function chargerContexteInterpretation(int $employeId): ?array
@@ -370,6 +446,11 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
                     'actif_regles_nouvelles' => $this->actif ? 1 : 0,
                     'jours_travailles' => '1,2,3,4,5',
                 ];
+            }
+
+            protected function trouverJourFerie(int $employeId, string $date): ?array
+            {
+                return $this->jourFerie;
             }
 
             protected function chargerCreneauxInterpretation(int $tenantId): array
@@ -391,7 +472,7 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
                 int $tenantId,
                 int $employeId,
                 string $date,
-                bool $inclureLendemain
+                string $heureLimiteLendemain
             ): array {
                 return $this->pointages;
             }
@@ -404,7 +485,7 @@ final class CalculPresenceServiceOptInTest extends CIUnitTestCase
                     'mode_calcul_heures_sup' => 'ARRONDI',
                     'pas_arrondi_heures_sup_minutes' => 15,
                     'duree_pause_minimum_minutes' => 15,
-                    'duree_pause_maximum_minutes' => 120,
+                    'duree_pause_maximum_minutes' => 130,
                 ], $this->parametres);
             }
 

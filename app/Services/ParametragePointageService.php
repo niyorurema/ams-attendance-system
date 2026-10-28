@@ -17,7 +17,7 @@ class ParametragePointageService
         'mode_calcul_heures_sup' => 'ARRONDI',
         'pas_arrondi_heures_sup_minutes' => 15,
         'duree_pause_minimum_minutes' => 15,
-        'duree_pause_maximum_minutes' => 120,
+        'duree_pause_maximum_minutes' => 130,
     ];
 
     /** @var array<int, array<string, array<string, mixed>|null>> */

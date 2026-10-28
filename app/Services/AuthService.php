@@ -101,7 +101,15 @@ class AuthService
             if ($ldapUser === null) {
                 return $this->echec('Identifiants LDAP invalides.');
             }
-            $user = $this->trouverUtilisateur($tenantId, (string) ($ldapUser['email'] ?? $email));
+            $ldapEmail = strtolower(trim((string) ($ldapUser['email'] ?? '')));
+            $emailForLookup = filter_var($ldapEmail, FILTER_VALIDATE_EMAIL) ? $ldapEmail : $email;
+            $user = filter_var($emailForLookup, FILTER_VALIDATE_EMAIL)
+                ? $this->trouverUtilisateur($tenantId, $emailForLookup)
+                : null;
+            if ($user === null && filter_var($ldapEmail, FILTER_VALIDATE_EMAIL)) {
+                $matricule = trim((string) ($ldapUser['matricule'] ?? ''));
+                $user = $this->lierLecteurEtauApresConnexion($tenantId, $matricule !== '' ? $matricule : $username, $ldapEmail);
+            }
             if ($user === null) {
                 $this->logAuth($tenantId, null, $email, 'LDAP', 'COMPTE_INACTIF', 'Compte LDAP non synchronisé ou inactif.');
                 return $this->echec('Compte utilisateur indisponible.');
@@ -141,6 +149,72 @@ class AuthService
     {
         $user = $this->userModel->where('tenant_id', $tenantId)->where('email', $email)->first();
         return is_array($user) && (int) $user['is_active'] === 1 ? $user : null;
+    }
+
+    /**
+     * Lie le premier login LDAP à l'unique compte lecteur ETau correspondant au matricule.
+     *
+     * @return ?array<string, mixed>
+     */
+    private function lierLecteurEtauApresConnexion(int $tenantId, string $matricule, string $email): ?array
+    {
+        if ($tenantId !== 1 || $matricule === '' || mb_strlen($matricule) > 50) {
+            return null;
+        }
+
+        $db = Database::connect();
+        $matches = $db->query(
+            'SELECT u.id AS user_id, e.id AS employe_id
+             FROM users u
+             INNER JOIN employes e ON e.id = u.employe_id AND e.tenant_id = u.tenant_id
+             WHERE u.tenant_id = ? AND u.role = ? AND u.is_active = 1 AND u.email IS NULL
+               AND u.deleted_at IS NULL AND e.deleted_at IS NULL
+               AND e.source_systeme = ? AND e.matricule = ?
+             LIMIT 2',
+            [$tenantId, 'lecteur', 'etau', $matricule]
+        )->getResultArray();
+        if (count($matches) !== 1) {
+            return null;
+        }
+
+        $userId = (int) $matches[0]['user_id'];
+        $employeeId = (int) $matches[0]['employe_id'];
+        if ($db->table('users')
+            ->where('tenant_id', $tenantId)
+            ->where('email', $email)
+            ->countAllResults() > 0
+        ) {
+            return null;
+        }
+
+        $db->transBegin();
+        try {
+            $updatedUser = $db->table('users')
+                ->where('id', $userId)
+                ->where('tenant_id', $tenantId)
+                ->where('role', 'lecteur')
+                ->where('email', null)
+                ->where('is_active', 1)
+                ->update(['email' => $email, 'auth_source' => 'LDAP', 'updated_at' => date('Y-m-d H:i:s')]);
+            if (! $updatedUser || $db->affectedRows() !== 1) {
+                $db->transRollback();
+                return null;
+            }
+
+            if (! $db->table('employes')->where('id', $employeeId)->where('tenant_id', $tenantId)->update([
+                'email' => $email,
+                'updated_at' => date('Y-m-d H:i:s'),
+            ]) || $db->transStatus() === false) {
+                throw new \RuntimeException('Mise à jour du profil ETau après authentification refusée.');
+            }
+
+            $db->transCommit();
+        } catch (Throwable $exception) {
+            $db->transRollback();
+            throw $exception;
+        }
+
+        return $this->userModel->where('tenant_id', $tenantId)->find($userId);
     }
 
     /** @return array{success:bool,user:?array,token:?string,auth_source:?string,message:?string} */

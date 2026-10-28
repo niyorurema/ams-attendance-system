@@ -28,6 +28,7 @@ Le chiffre « 11 tables » ne correspond pas à l’état courant des migrations
 | `rapports_envoyes` | `tenant_id`, planification facultative, utilisateur, date/heure, format, chemin, destinataire, statut et erreur | Tenant, planification facultative, utilisateur |
 | `auth_logs` | `tenant_id`, `user_id` facultatif, email, source, statut, IP, user-agent, message d’erreur, date | Tenant et utilisateur facultatif |
 | `unit_chefs` | `tenant_id`, `unite_id`, `user_id`, type de mandat, période, actif, provenance et remarque | Tenant, unité, utilisateur |
+| `application_settings` | Clé/valeur des réglages globaux d’intégration, indicateur de chiffrement, auteur et timestamps | Réglages système; les valeurs sensibles sont chiffrées |
 
 Les migrations sont la source de vérité pour toutes les colonnes, contraintes et valeurs d’ENUM. Consultez le fichier de migration correspondant avant toute modification de schéma.
 
@@ -35,7 +36,7 @@ Les mots de passe ne doivent contenir que des hashes `password_hash`; `com_key`,
 
 ## Import GPIO (OBR)
 
-La connexion `gpio` de `app/Config/Database.php` cible la base source `etau` et accepte ses paramètres de connexion via `GPIO_DB_HOSTNAME`, `GPIO_DB_PORT`, `GPIO_DB_USERNAME` et `GPIO_DB_PASSWORD`. N’inscrivez pas le mot de passe dans le dépôt. Le service d’import n’exécute que des lectures sur GPIO; les écritures éventuelles sont limitées à AMS.
+Les paramètres de connexion GPIO/ETau sont enregistrés dans `application_settings` depuis **Paramètres → Intégrations**. Les secrets SMTP et GPIO y sont chiffrés, et le secret LDAP chiffré est stocké dans la configuration du tenant. La clé de chiffrement dédiée se trouve dans `writable/keys/integration-settings.key` et doit être sauvegardée séparément de la base. Le service d’import n’exécute que des lectures sur GPIO; les écritures éventuelles sont limitées à AMS.
 
 La commande `php spark gpio:importer --tenant=1` est en simulation par défaut. Les étapes disponibles sont `hierarchie`, `chefs`, `employes` et `all`. L’étape employés ne traite que les lignes `etau_utilisateur` dont `typeObjet='U'`, puis rapproche les employés AMS par identifiant source, matricule ou identifiant de capteur; elle ne crée pas d’employés. L’étape chefs exige en plus un compte AMS lié à l’employé. Les motifs d’exclusion sont agrégés dans le rapport, avec au plus dix exemples.
 

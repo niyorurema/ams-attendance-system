@@ -37,6 +37,7 @@ class LdapAuthService
             try {
                 $connexion = $this->ouvrirConnexion($host, $configuration['port']);
                 $this->configurerConnexion($connexion);
+                $this->activerTls($connexion, (bool) ($configuration['use_tls'] ?? false));
                 if (! $this->effectuerBind($connexion, $configuration['bind_dn'], $configuration['bind_password'])) {
                     throw new \RuntimeException('Échec du bind du compte de service LDAP.');
                 }
@@ -83,39 +84,14 @@ class LdapAuthService
             return ['success' => false, 'message' => 'Tenant introuvable.', 'resultats' => []];
         }
 
-        $envPassword = (string) env('LDAP_BIND_PASSWORD', '');
-        log_message('debug', 'LDAP_BIND_PASSWORD length: ' . strlen($envPassword));
-
-        $password = (string) ($tenant['ldap_bind_password'] ?? '');
-        if ($password === '') {
-            $password = $envPassword;
+        $configuration = $this->getConfigurationForTenant($tenantId);
+        $password = (string) $configuration['bind_password'];
+        $bindDn = trim((string) $configuration['bind_dn']);
+        $hosts = $this->getLdapHosts($tenantId);
+        if ($password === '' || $bindDn === '' || $hosts === []) {
+            return $this->echecConfiguration($tenantId, 'Configurez les serveurs LDAP, le DN et le mot de passe du compte de service dans Paramètres > LDAP.');
         }
-        if ($password === '') {
-            return $this->echecConfiguration($tenantId, 'LDAP_BIND_PASSWORD non configuré dans .env');
-        }
-
-        $bindDn = (string) ($tenant['ldap_bind_dn'] ?? '');
-        if ($bindDn === '') {
-            $bindDn = (string) env('LDAP_BIND_DN', '');
-        }
-        if ($bindDn === '') {
-            return $this->echecConfiguration($tenantId, 'LDAP_BIND_DN non configuré.');
-        }
-
-        $primaryHost = trim((string) ($tenant['ldap_host'] ?? ''));
-        if ($primaryHost === '') {
-            $primaryHost = trim((string) env('LDAP_HOST_PRIMARY', ''));
-        }
-        if ($primaryHost === '') {
-            return $this->echecConfiguration($tenantId, 'LDAP_HOST non configuré');
-        }
-
-        $hosts = array_values(array_unique(array_filter([
-            $primaryHost,
-            $tenant['ldap_host_secondary'] ?? env('LDAP_HOST_SECONDARY'),
-            $tenant['ldap_host_tertiary'] ?? env('LDAP_HOST_TERTIARY'),
-        ], static fn ($host): bool => is_string($host) && trim($host) !== '')));
-        $port = (int) ($tenant['ldap_port'] ?? env('LDAP_PORT', 389));
+        $port = (int) $configuration['port'];
         $resultats = [];
         $success = false;
 
@@ -123,7 +99,7 @@ class LdapAuthService
             $host = trim((string) $host);
             $debut = microtime(true);
             try {
-                $tentative = $this->testerBind($host, $port, $bindDn, $password);
+                $tentative = $this->testerBind($host, $port, $bindDn, $password, (bool) $configuration['use_tls']);
                 if (! $tentative['success']) {
                     $estUneIp = filter_var($host, FILTER_VALIDATE_IP) !== false;
                     $ip = $estUneIp ? $host : gethostbyname($host);
@@ -132,7 +108,7 @@ class LdapAuthService
                     }
 
                     if ($ip !== $host) {
-                        $tentative = $this->testerBind($ip, $port, $bindDn, $password);
+                        $tentative = $this->testerBind($ip, $port, $bindDn, $password, (bool) $configuration['use_tls']);
                     }
 
                     if (! $tentative['success']) {
@@ -166,7 +142,7 @@ class LdapAuthService
     }
 
     /** @return array{success:bool,message:string} */
-    protected function testerBind(string $host, int $port, string $bindDn, string $password): array
+    protected function testerBind(string $host, int $port, string $bindDn, string $password, bool $useTls = false): array
     {
         $connexion = $this->creerConnexionLdap($host, $port);
         if ($connexion === false) {
@@ -177,6 +153,9 @@ class LdapAuthService
             ldap_set_option($connexion, LDAP_OPT_PROTOCOL_VERSION, 3);
             ldap_set_option($connexion, LDAP_OPT_NETWORK_TIMEOUT, self::TIMEOUT_SECONDES);
             ldap_set_option($connexion, LDAP_OPT_REFERRALS, 0);
+            if ($useTls && ! @ldap_start_tls($connexion)) {
+                return ['success' => false, 'message' => 'Démarrage TLS LDAP refusé.'];
+            }
 
             if (@ldap_bind($connexion, $bindDn, $password)) {
                 return ['success' => true, 'message' => 'Bind OK (' . $host . ')'];
@@ -231,6 +210,7 @@ class LdapAuthService
             try {
                 $connexion = $this->ouvrirConnexion($host, (int) $configuration['port']);
                 $this->configurerConnexion($connexion);
+                $this->activerTls($connexion, (bool) ($configuration['use_tls'] ?? false));
                 if (! $this->effectuerBind($connexion, (string) $configuration['bind_dn'], (string) $configuration['bind_password'])) {
                     throw new \RuntimeException('Échec du bind du compte de service LDAP.');
                 }
@@ -512,9 +492,7 @@ class LdapAuthService
             ->where('deleted_at', null)
             ->get()
             ->getRowArray() ?? [];
-        $sourceBase = ! empty($tenant['ldap_base_dn'])
-            ? 'tenants.ldap_base_dn'
-            : (trim((string) env('LDAP_USER_BASE_DN', '')) !== '' ? 'LDAP_USER_BASE_DN' : 'LDAP_BASE_DN');
+        $sourceBase = ! empty($tenant['ldap_base_dn']) ? 'tenants.ldap_base_dn' : 'tenant settings';
 
         $resultats = [];
         $erreurs = [];
@@ -523,6 +501,7 @@ class LdapAuthService
             try {
                 $connexion = $this->ouvrirConnexion($host, (int) $configuration['port']);
                 $this->configurerConnexion($connexion);
+                $this->activerTls($connexion, (bool) ($configuration['use_tls'] ?? false));
                 if (! $this->effectuerBind($connexion, (string) $configuration['bind_dn'], (string) $configuration['bind_password'])) {
                     throw new \RuntimeException('Échec du bind du compte de service LDAP.');
                 }
@@ -602,6 +581,7 @@ class LdapAuthService
             try {
                 $connexion = $this->ouvrirConnexion($host, (int) $configuration['port']);
                 $this->configurerConnexion($connexion);
+                $this->activerTls($connexion, (bool) ($configuration['use_tls'] ?? false));
                 if (! $this->effectuerBind($connexion, (string) $configuration['bind_dn'], (string) $configuration['bind_password'])) {
                     throw new \RuntimeException('Échec du bind du compte de service LDAP.');
                 }
@@ -638,6 +618,7 @@ class LdapAuthService
             try {
                 $connexion = $this->ouvrirConnexion($host, $configuration['port']);
                 $this->configurerConnexion($connexion);
+                $this->activerTls($connexion, (bool) ($configuration['use_tls'] ?? false));
                 if (! $this->effectuerBind($connexion, $configuration['bind_dn'], $configuration['bind_password'])) {
                     throw new \RuntimeException('Échec du bind du compte de service LDAP.');
                 }
@@ -721,10 +702,16 @@ class LdapAuthService
             ->get()
             ->getRowArray() ?? [];
 
-        return array_values(array_unique(array_filter([
+        $tenantHosts = array_values(array_unique(array_filter([
             $tenant['ldap_host'] ?? null,
             $tenant['ldap_host_secondary'] ?? null,
             $tenant['ldap_host_tertiary'] ?? null,
+        ], static fn ($host): bool => is_string($host) && trim($host) !== '')));
+        if ($tenantHosts !== []) {
+            return $tenantHosts;
+        }
+
+        return array_values(array_unique(array_filter([
             env('LDAP_HOST_PRIMARY'),
             env('LDAP_HOST_SECONDARY'),
             env('LDAP_HOST_TERTIARY'),
@@ -748,23 +735,24 @@ class LdapAuthService
         return null;
     }
 
-    /** @return array<string, string|int> */
+    /** @return array<string, string|int|bool> */
     protected function getConfiguration(): array
     {
         return [
             'port' => (int) env('LDAP_PORT', 389),
-            'bind_dn' => (string) env('LDAP_BIND_DN'),
-            'bind_password' => (string) env('LDAP_BIND_PASSWORD'),
-            'user_base_dn' => (string) env('LDAP_USER_BASE_DN', env('LDAP_BASE_DN')),
+            'bind_dn' => (string) env('LDAP_BIND_DN', ''),
+            'bind_password' => (string) env('LDAP_BIND_PASSWORD', ''),
+            'user_base_dn' => (string) env('LDAP_USER_BASE_DN', env('LDAP_BASE_DN', '')),
             'user_filter' => (string) env('LDAP_USER_FILTER', '(sAMAccountName={username})'),
             'email' => (string) env('LDAP_ATTR_EMAIL', 'mail'),
             'nom' => (string) env('LDAP_ATTR_NOM', 'sn'),
             'prenom' => (string) env('LDAP_ATTR_PRENOM', 'givenName'),
             'matricule' => (string) env('LDAP_ATTR_MATRICULE', 'employeeID'),
+            'use_tls' => filter_var(env('LDAP_USE_TLS', false), FILTER_VALIDATE_BOOLEAN),
         ];
     }
 
-    /** @return array<string, string|int> */
+    /** @return array<string, string|int|bool> */
     protected function getConfigurationForTenant(int $tenantId): array
     {
         $configuration = $this->getConfiguration();
@@ -774,10 +762,13 @@ class LdapAuthService
             ->get()
             ->getRowArray() ?? [];
 
+        $tenantHasLdapHosts = array_filter([
+            $tenant['ldap_host'] ?? null,
+            $tenant['ldap_host_secondary'] ?? null,
+            $tenant['ldap_host_tertiary'] ?? null,
+        ], static fn ($host): bool => is_string($host) && trim($host) !== '') !== [];
         $tenantSettings = [
             'port' => 'ldap_port',
-            'bind_dn' => 'ldap_bind_dn',
-            'bind_password' => 'ldap_bind_password',
             'user_base_dn' => 'ldap_base_dn',
             'user_filter' => 'ldap_user_filter',
             'email' => 'ldap_attr_email',
@@ -791,6 +782,19 @@ class LdapAuthService
                 $configuration[$configurationKey] = $configurationKey === 'port' ? (int) $value : (string) $value;
             }
         }
+        if (! $tenantHasLdapHosts && (int) ($tenant['ldap_port'] ?? 389) === 389) {
+            $configuration['port'] = (int) env('LDAP_PORT', 389);
+        }
+        $bindDn = trim((string) ($tenant['ldap_bind_dn'] ?? ''));
+        if ($bindDn !== '') {
+            $configuration['bind_dn'] = $bindDn;
+        }
+        $configuration['bind_password'] = (new ApplicationIntegrationSettings())->decryptStoredSetting(
+            $tenant['ldap_bind_password_encrypted'] ?? null
+        ) ?: (string) ($tenant['ldap_bind_password'] ?? $configuration['bind_password']);
+        $configuration['use_tls'] = $tenantHasLdapHosts
+            ? (bool) ($tenant['ldap_use_tls'] ?? false)
+            : ((bool) ($tenant['ldap_use_tls'] ?? false) || (bool) $configuration['use_tls']);
 
         return $configuration;
     }
@@ -832,6 +836,13 @@ class LdapAuthService
         ldap_set_option($connexion, LDAP_OPT_PROTOCOL_VERSION, 3);
         ldap_set_option($connexion, LDAP_OPT_REFERRALS, 0);
         ldap_set_option($connexion, LDAP_OPT_NETWORK_TIMEOUT, self::TIMEOUT_SECONDES);
+    }
+
+    protected function activerTls(mixed $connexion, bool $useTls): void
+    {
+        if ($useTls && ! @ldap_start_tls($connexion)) {
+            throw new \RuntimeException('Démarrage TLS LDAP refusé.');
+        }
     }
 
     protected function effectuerBind(mixed $connexion, string $dn, string $password): bool
