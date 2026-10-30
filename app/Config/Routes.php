@@ -41,6 +41,8 @@ $routes->group('api', ['filter' => 'jwt'], static function ($routes): void {
 	$routes->put('admin/integrations', 'Api\\IntegrationSettingsController::updateSystem');
 	$routes->post('admin/integrations/smtp/test', 'Api\\IntegrationSettingsController::testSmtp');
 	$routes->post('admin/integrations/gpio/test', 'Api\\IntegrationSettingsController::testGpio');
+	$routes->post('admin/integrations/gpio/sync-preview', 'Api\\IntegrationSettingsController::previewGpioSync');
+	$routes->post('admin/integrations/gpio/sync', 'Api\\IntegrationSettingsController::syncGpio');
 	$routes->get('admin/tenant/pointage-parametres', 'Api\\TenantConfigController::pointageParametres');
 	$routes->put('admin/tenant/pointage-parametres', 'Api\\TenantConfigController::mettreAJourPointageParametres');
 	$routes->post('admin/tenant/logo', 'Api\\TenantConfigController::uploadLogo');

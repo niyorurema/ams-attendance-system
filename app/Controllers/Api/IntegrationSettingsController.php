@@ -5,6 +5,8 @@ namespace App\Controllers\Api;
 use App\Services\ApplicationIntegrationSettings;
 use App\Services\LdapEmployeeEmailSyncService;
 use App\Services\LdapAuthService;
+use App\Services\ImportGpioService;
+use App\Services\SystemJobService;
 use PHPMailer\PHPMailer\PHPMailer;
 use RuntimeException;
 use Throwable;
@@ -149,6 +151,139 @@ final class IntegrationSettingsController extends BaseApiController
         } catch (Throwable $exception) {
             log_message('error', 'Test de connexion GPIO impossible : {error}', ['error' => $exception->getMessage()]);
             return $this->errorResponse('Échec de connexion à la base GPIO. Vérifiez les paramètres et les droits en lecture.', 502);
+        }
+    }
+
+    public function previewGpioSync(): ResponseInterface
+    {
+        return $this->executeGpioSync(true);
+    }
+
+    public function syncGpio(): ResponseInterface
+    {
+        $input = $this->jsonInput();
+        if (($input['confirm'] ?? null) !== true || count($input) !== 1) {
+            return $this->errorResponse('Confirmez explicitement la synchronisation GPIO.', 400);
+        }
+
+        return $this->executeGpioSync(false);
+    }
+
+    private function executeGpioSync(bool $dryRun): ResponseInterface
+    {
+        if (! $this->isSuperAdmin()) {
+            return $this->errorResponse('Cette action est réservée au super-administrateur.', 403);
+        }
+
+        $db = Database::connect();
+        $jobs = new SystemJobService($db);
+        $runId = null;
+        $lockAcquired = false;
+        $transactionStarted = false;
+
+        try {
+            $userId = (int) ($this->claims()?->sub ?? 0);
+            if (! $dryRun && ! (new ApplicationIntegrationSettings($db))->gpioSyncEnabled()) {
+                throw new RuntimeException('Synchronisation GPIO désactivée. Activez-la dans les paramètres d’intégration.');
+            }
+
+            $lock = $db->query('SELECT GET_LOCK(?, 0) AS acquired', ['ams_gpio_sync_obr'])->getRowArray();
+            if ((int) ($lock['acquired'] ?? 0) !== 1) {
+                throw new RuntimeException('Une synchronisation GPIO est déjà en cours.');
+            }
+            $lockAcquired = true;
+
+            if (! $dryRun) {
+                $tenant = $db->table('tenants')
+                    ->select('auth_mode')
+                    ->where('id', 1)
+                    ->where('deleted_at', null)
+                    ->get()
+                    ->getRowArray();
+                if ($tenant === null) {
+                    throw new RuntimeException('Tenant OBR #1 introuvable ou supprimé.');
+                }
+                if (! in_array(strtoupper((string) ($tenant['auth_mode'] ?? '')), ['LDAP', 'HYBRIDE'], true)) {
+                    throw new RuntimeException('Le tenant OBR doit être configuré en mode LDAP ou HYBRIDE avant la synchronisation.');
+                }
+            }
+
+            $runId = $jobs->start('gpio:sync-obr', 1, $userId > 0 ? $userId : null, [
+                'source' => 'interface',
+                'dry_run' => $dryRun,
+            ]);
+
+            if (! $dryRun) {
+                $emailSchema = $db->query(
+                    "SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS "
+                    . "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND COLUMN_NAME = 'email'"
+                )->getRowArray();
+                if (($emailSchema['IS_NULLABLE'] ?? 'NO') !== 'YES') {
+                    throw new RuntimeException('users.email doit accepter NULL avant la synchronisation GPIO.');
+                }
+
+                $db->transBegin();
+                $transactionStarted = true;
+            }
+
+            $service = new ImportGpioService(null, $db);
+            $results = [
+                'hierarchie' => $service->importerHierarchie(1, $dryRun),
+                'employes' => $service->synchroniserEmployes(1, $dryRun),
+                'affectations' => $service->assignerEmployesAuxUnites(1, $dryRun),
+                'mandats' => $service->importerChefs(1, $dryRun),
+            ];
+            $errors = array_sum(array_column($results, 'erreurs'));
+
+            if (! $dryRun && ($errors > 0 || $db->transStatus() === false)) {
+                throw new RuntimeException(sprintf(
+                    'Synchronisation annulée : %d erreur(s); aucune modification AMS conservée.',
+                    $errors
+                ));
+            }
+            if (! $dryRun) {
+                $db->transCommit();
+                $transactionStarted = false;
+            }
+
+            $summary = [];
+            foreach ($results as $name => $stats) {
+                $summary[$name] = array_intersect_key(
+                    $stats,
+                    array_flip(['lues', 'crees', 'maj', 'ignores', 'erreurs'])
+                );
+            }
+            $jobs->finish($runId, $errors > 0 ? 'PARTIAL' : 'SUCCESS', $summary, $errors > 0 ? "$errors erreur(s)." : null);
+
+            return $this->successResponse([
+                'dry_run' => $dryRun,
+                'results' => $results,
+            ], $dryRun ? 'Simulation GPIO terminée. Aucune donnée n’a été modifiée.' : 'Synchronisation GPIO terminée.', 200);
+        } catch (Throwable $exception) {
+            if ($db !== null && $transactionStarted) {
+                try {
+                    $db->transRollback();
+                } catch (Throwable $rollbackError) {
+                    log_message('critical', 'Retour arrière GPIO impossible : {error}', ['error' => $rollbackError->getMessage()]);
+                }
+            }
+            if ($runId !== null) {
+                try {
+                    $jobs->finish($runId, 'ERROR', [], $exception->getMessage());
+                } catch (Throwable $trackingError) {
+                    log_message('critical', 'Impossible de journaliser l’échec GPIO : {error}', ['error' => $trackingError->getMessage()]);
+                }
+            }
+            log_message('error', 'Synchronisation GPIO API impossible : {error}', ['error' => $exception->getMessage()]);
+            return $this->errorResponse($exception->getMessage(), 502);
+        } finally {
+            if ($lockAcquired) {
+                try {
+                    $db->query('SELECT RELEASE_LOCK(?)', ['ams_gpio_sync_obr']);
+                } catch (Throwable $exception) {
+                    log_message('warning', 'Libération du verrou GPIO impossible : {error}', ['error' => $exception->getMessage()]);
+                }
+            }
         }
     }
 
